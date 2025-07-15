@@ -24,6 +24,14 @@ Pre-buit binaries can be found on the [official website](http://git.dkforestseea
 - Delete all messages `/dall`
 - Ignore someone `/ignore username`
 - Unignore someone `/unignore username`
+- Ban a username and kick `/ban username`
+- Ban a username exactly `/ban "username"`
+- Filter messages containing text `/filter text`
+- List banned usernames `/banlist`
+- List exact banned usernames `/banexactlist`
+- List filtered message terms `/filterlist`
+- Unban a username `/unban username`
+- Remove a message filter `/unfilter text`
 - Toggle notifications sound `m`
 - Toggle a "guest" view, by filtering out PMs and "Members chat" `shift+G`
 - Toggle a "members" view, by filtering out PMs and "Guest chat" `shift+M`
@@ -33,6 +41,7 @@ Pre-buit binaries can be found on the [official website](http://git.dkforestseea
 - Directly tag author of selected message `t` will prefil the input with `@username `
 - Directly private message author of selected message `p` will prefil the input with `/pm username `
 - Shortcut to kick author of selected message `ctrl+k` will prefil the input with `/kick username `
+- Shortcut to ban author of selected message `ctrl+b` will prefil the input with `/ban username `
 - captcha is displayed directly in terminal 10 times the real size
 - Upload file `/u C:\path\to\file.png @username message` (@username is optional) `@members` for members group
 - `<tab>` to autocomplete usernames while typing
@@ -121,3 +130,22 @@ Comands must start from "!" in the textbox, but "!" are not required in config.
 command1 = "This is the mesage that will be posted"
 hello = "hello everyone !"
 ```
+
+## Configuration file
+
+The configuration is stored using `confy`. On Linux this is usually
+`~/.config/bhcli/bhcli.toml`. You can edit this file to preload profiles,
+create custom commands and maintain filters.
+
+To manually add or remove banned usernames or message filters you can edit the
+`bad_usernames`, `bad_exact_usernames` and `bad_messages` arrays in this file:
+
+```toml
+bad_usernames = ["spammer1", "spammer2"]
+bad_exact_usernames = ["baduser"]
+bad_messages = ["buy now", "free money"]
+```
+
+Filters modified using `/ban`, `/ban "name"`, `/filter`, `/unban` and `/unfilter` are saved
+back to this file automatically and any custom commands in the `[commands]`
+section are preserved.

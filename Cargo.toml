@@ -17,7 +17,7 @@ clipboard = "0.5.0"
 colors-transform = "0.2.4"
 confy = "0.5.1"
 crossbeam = "0.8.1"
-crossbeam-channel = "0.5.1"
+crossbeam-channel = "0.5.15"
 crossterm = { version = "0.26.1" }
 http = "0.2.4"
 image = "0.24.6"

@@ -1,6 +1,7 @@
 mod bhc;
 mod lechatphp;
 mod util;
+mod harm;
 
 use crate::lechatphp::LoginErr;
 use anyhow::{anyhow, Context};
@@ -54,6 +55,7 @@ use tui::{
 };
 use unicode_width::UnicodeWidthStr;
 use util::StatefulList;
+use harm::{action_from_score, score_message, Action};
 
 const LANG: &str = "en";
 const SEND_TO_ALL: &str = "s *";
@@ -112,6 +114,14 @@ struct Profile {
 #[derive(Default, Debug, Serialize, Deserialize)]
 struct MyConfig {
     dkf_api_key: Option<String>,
+    #[serde(default)]
+    bad_usernames: Vec<String>,
+    #[serde(default)]
+    bad_exact_usernames: Vec<String>,
+    #[serde(default)]
+    bad_messages: Vec<String>,
+    #[serde(default)]
+    commands: HashMap<String, String>,
     profiles: HashMap<String, Profile>,
 }
 
@@ -170,6 +180,13 @@ struct Opts {
 
     #[arg(long)]
     sxiv: bool,
+
+    #[arg(skip)]
+    bad_usernames: Option<Vec<String>>,
+    #[arg(skip)]
+    bad_exact_usernames: Option<Vec<String>>,
+    #[arg(skip)]
+    bad_messages: Option<Vec<String>>,
 }
 
 struct LeChatPHPConfig {
@@ -221,6 +238,10 @@ struct LeChatPHPClient {
 
     color_tx: crossbeam_channel::Sender<()>,
     color_rx: Arc<Mutex<crossbeam_channel::Receiver<()>>>,
+
+    bad_username_filters: Arc<Mutex<Vec<String>>>,
+    bad_exact_username_filters: Arc<Mutex<Vec<String>>>,
+    bad_message_filters: Arc<Mutex<Vec<String>>>,
 }
 
 impl LeChatPHPClient {
@@ -365,6 +386,10 @@ impl LeChatPHPClient {
         let exit_rx = sig.lock().unwrap().clone();
         let sig = Arc::clone(sig);
         let members_tag = self.config.members_tag.clone();
+        let tx = self.tx.clone();
+        let bad_usernames = Arc::clone(&self.bad_username_filters);
+        let bad_exact_usernames = Arc::clone(&self.bad_exact_username_filters);
+        let bad_messages = Arc::clone(&self.bad_message_filters);
         thread::spawn(move || loop {
             let (_stream, stream_handle) = OutputStream::try_default().unwrap();
             let source = Decoder::new_mp3(Cursor::new(SOUND1)).unwrap();
@@ -383,6 +408,10 @@ impl LeChatPHPClient {
                 &datetime_fmt,
                 &messages,
                 &mut should_notify,
+                &tx,
+                &bad_usernames,
+                &bad_exact_usernames,
+                &bad_messages,
             ) {
                 log::error!("{}", err);
             };
@@ -559,6 +588,236 @@ impl LeChatPHPClient {
             let msg = PostType::Profile("#90ee90".to_owned(), username);
             tx.send(msg).unwrap();
         });
+    }
+
+    fn save_filters(&self) {
+        if let Ok(mut cfg) = confy::load::<MyConfig>("bhcli", None) {
+            cfg.bad_usernames = self.bad_username_filters.lock().unwrap().clone();
+            cfg.bad_exact_usernames = self.bad_exact_username_filters.lock().unwrap().clone();
+            cfg.bad_messages = self.bad_message_filters.lock().unwrap().clone();
+            if let Err(e) = confy::store("bhcli", None, cfg) {
+                log::error!("failed to store config: {}", e);
+            }
+        }
+    }
+
+    fn list_filters(&self, usernames: bool) -> String {
+        let list = if usernames {
+            self.bad_username_filters.lock().unwrap().clone()
+        } else {
+            self.bad_message_filters.lock().unwrap().clone()
+        };
+        if list.is_empty() {
+            String::from("(empty)")
+        } else {
+            list.join(", ")
+        }
+    }
+
+    fn list_exact_filters(&self) -> String {
+        let list = self.bad_exact_username_filters.lock().unwrap().clone();
+        if list.is_empty() {
+            String::from("(empty)")
+        } else {
+            list.join(", ")
+        }
+    }
+
+    fn remove_filter(&self, term: &str, usernames: bool) -> bool {
+        if usernames {
+            {
+                let mut filters = self.bad_username_filters.lock().unwrap();
+                if let Some(pos) = filters.iter().position(|x| x == term) {
+                    filters.remove(pos);
+                    return true;
+                }
+            }
+            {
+                let mut filters = self.bad_exact_username_filters.lock().unwrap();
+                if let Some(pos) = filters.iter().position(|x| x == term) {
+                    filters.remove(pos);
+                    return true;
+                }
+            }
+            false
+        } else {
+            let mut filters = self.bad_message_filters.lock().unwrap();
+            if let Some(pos) = filters.iter().position(|x| x == term) {
+                filters.remove(pos);
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    fn apply_ban_filters(&self, users: &Arc<Mutex<Users>>) {
+        let users = users.lock().unwrap();
+        let name_filters = self.bad_username_filters.lock().unwrap().clone();
+        let exact_filters = self.bad_exact_username_filters.lock().unwrap().clone();
+        for (_, name) in &users.guests {
+            if exact_filters.iter().any(|f| f == name)
+                || name_filters
+                    .iter()
+                    .any(|f| name.to_lowercase().contains(&f.to_lowercase()))
+            {
+                let _ = self.tx.send(PostType::Kick(String::new(), name.clone()));
+            }
+        }
+    }
+
+    fn process_command(&mut self, input: &str, app: &mut App, users: &Arc<Mutex<Users>>) -> bool {
+        if input == "/dl" {
+            self.post_msg(PostType::DeleteLast).unwrap();
+        } else if let Some(captures) = DLX_RGX.captures(input) {
+            let x: usize = captures.get(1).unwrap().as_str().parse().unwrap();
+            for _ in 0..x {
+                self.post_msg(PostType::DeleteLast).unwrap();
+            }
+        } else if input == "/dall" {
+            self.post_msg(PostType::DeleteAll).unwrap();
+        } else if input == "/cycles" {
+            self.color_tx.send(()).unwrap();
+        } else if input == "/cycle1" {
+            self.start_cycle(true);
+        } else if input == "/cycle2" {
+            self.start_cycle(false);
+        } else if input == "/kall" {
+            let username = "s _".to_owned();
+            let msg = "".to_owned();
+            self.post_msg(PostType::Kick(msg, username)).unwrap();
+        } else if let Some(captures) = PM_RGX.captures(input) {
+            let username = &captures[1];
+            let msg = captures[2].to_owned();
+            let to = Some(username.to_owned());
+            self.post_msg(PostType::Post(msg, to)).unwrap();
+            app.input = format!("/pm {} ", username);
+            app.input_idx = app.input.width();
+        } else if let Some(captures) = NEW_NICKNAME_RGX.captures(input) {
+            let new_nickname = captures[1].to_owned();
+            self.post_msg(PostType::NewNickname(new_nickname)).unwrap();
+        } else if let Some(captures) = NEW_COLOR_RGX.captures(input) {
+            let new_color = captures[1].to_owned();
+            self.post_msg(PostType::NewColor(new_color)).unwrap();
+        } else if let Some(captures) = KICK_RGX.captures(input) {
+            let username = captures[1].to_owned();
+            let msg = captures[2].to_owned();
+            self.post_msg(PostType::Kick(msg, username)).unwrap();
+        } else if input.starts_with("/banname ") || input.starts_with("/ban ") {
+            let mut name = if input.starts_with("/banname ") {
+                remove_prefix(input, "/banname ")
+            } else {
+                remove_prefix(input, "/ban ")
+            };
+            let exact = name.starts_with('"') && name.ends_with('"') && name.len() >= 2;
+            if exact {
+                name = &name[1..name.len()-1];
+            }
+            let name = name.to_owned();
+            if exact {
+                let mut f = self.bad_exact_username_filters.lock().unwrap();
+                f.push(name.clone());
+            } else {
+                let mut f = self.bad_username_filters.lock().unwrap();
+                f.push(name.clone());
+            }
+            self.save_filters();
+            self.post_msg(PostType::Kick(String::new(), name.clone())).unwrap();
+            self.apply_ban_filters(users);
+            let msg = if exact {
+                format!("Banned exact user \"{}\"", name)
+            } else {
+                format!("Banned userfilter \"{}\"", name)
+            };
+            self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+        } else if input.starts_with("/banmsg ") || input.starts_with("/filter ") {
+            let term = if input.starts_with("/banmsg ") {
+                remove_prefix(input, "/banmsg ")
+            } else {
+                remove_prefix(input, "/filter ")
+            };
+            let term = term.to_owned();
+            {
+                let mut f = self.bad_message_filters.lock().unwrap();
+                f.push(term.clone());
+            }
+            self.save_filters();
+            let msg = format!("Filtering messages including \"{}\"", term);
+            self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+        } else if input == "/banlist" {
+            let list = self.list_filters(true);
+            let list_exact = self.list_exact_filters();
+            let msg = format!("Banned names: {}", list) +
+                &if list_exact.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nBanned exact names: {}", list_exact)
+                };
+            self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+        } else if input == "/filterlist" {
+            let list = self.list_filters(false);
+            let msg = format!("Filtered messages: {}", list);
+            self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+        } else if input.starts_with("/unban ") {
+            let mut name = remove_prefix(input, "/unban ");
+            if name.starts_with('"') && name.ends_with('"') && name.len() >= 2 {
+                name = &name[1..name.len() - 1];
+            }
+            if self.remove_filter(name, true) {
+                self.save_filters();
+                let msg = format!("Unbanned {}", name);
+                self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+            }
+        } else if input.starts_with("/unfilter ") {
+            let term = remove_prefix(input, "/unfilter ");
+            if self.remove_filter(term, false) {
+                self.save_filters();
+                let msg = format!("Unfiltered \"{}\"", term);
+                self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+            }
+        } else if let Some(captures) = IGNORE_RGX.captures(input) {
+            let username = captures[1].to_owned();
+            self.post_msg(PostType::Ignore(username)).unwrap();
+        } else if let Some(captures) = UNIGNORE_RGX.captures(input) {
+            let username = captures[1].to_owned();
+            self.post_msg(PostType::Unignore(username)).unwrap();
+        } else if let Some(captures) = UPLOAD_RGX.captures(input) {
+            let file_path = captures[1].to_owned();
+            let send_to = match captures.get(2) {
+                Some(to_match) => match to_match.as_str() {
+                    "members" => SEND_TO_MEMBERS,
+                    "staffs" => SEND_TO_STAFFS,
+                    "admins" => SEND_TO_ADMINS,
+                    _ => SEND_TO_ALL,
+                },
+                None => SEND_TO_ALL,
+            }
+            .to_owned();
+            let msg = match captures.get(3) {
+                Some(msg_match) => msg_match.as_str().to_owned(),
+                None => "".to_owned(),
+            };
+            self.post_msg(PostType::Upload(file_path, send_to, msg)).unwrap();
+        } else if input.starts_with("!warn") {
+            let msg = input.trim_start_matches("!warn").trim();
+            let msg = if msg.starts_with('@') {
+                msg.to_owned()
+            } else if msg.is_empty() {
+                String::new()
+            } else {
+                format!("@{}", msg)
+            };
+            let end_msg = format!(
+                "This is your warning - {}, will be kicked next. Please read the !-rules / https://4-0-4.io/bhc-rules",
+                msg
+            );
+            self
+                .post_msg(PostType::Post(end_msg, None))
+                .unwrap();
+        } else {
+            return false;
+        }
+        true
     }
 
     fn handle_input(
@@ -789,6 +1048,18 @@ impl LeChatPHPClient {
                 ..
             } => self.handle_normal_mode_key_event_kick(app),
             KeyEvent {
+                code: KeyCode::Char('b'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.handle_normal_mode_key_event_ban(app),
+            KeyEvent {
+                code: KeyCode::Char('B'),
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.handle_normal_mode_key_event_ban_exact(app)
+            }
+            KeyEvent {
                 code: KeyCode::Char('w'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
@@ -849,9 +1120,16 @@ impl LeChatPHPClient {
         match key_event {
             KeyEvent {
                 code: KeyCode::Enter,
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::SHIFT)
+                || modifiers.contains(KeyModifiers::CONTROL) =>
+                self.handle_editing_mode_key_event_newline(app),
+            KeyEvent {
+                code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
                 ..
-            } => self.handle_editing_mode_key_event_enter(app)?,
+            } => self.handle_editing_mode_key_event_enter(app, users)?,
             KeyEvent {
                 code: KeyCode::Tab,
                 modifiers: KeyModifiers::NONE,
@@ -1258,6 +1536,36 @@ impl LeChatPHPClient {
         }
     }
 
+    fn handle_normal_mode_key_event_ban(&mut self, app: &mut App) {
+        if let Some(idx) = app.items.state.selected() {
+            if let Some(username) = get_username(
+                &self.base_client.username,
+                &app.items.items.get(idx).unwrap().text,
+                &self.config.members_tag,
+            ) {
+                app.input = format!("/ban {} ", username);
+                app.input_idx = app.input.width();
+                app.input_mode = InputMode::Editing;
+                app.items.unselect();
+            }
+        }
+    }
+
+    fn handle_normal_mode_key_event_ban_exact(&mut self, app: &mut App) {
+        if let Some(idx) = app.items.state.selected() {
+            if let Some(username) = get_username(
+                &self.base_client.username,
+                &app.items.items.get(idx).unwrap().text,
+                &self.config.members_tag,
+            ) {
+                app.input = format!(r#"/ban "{}" "#, username);
+                app.input_idx = app.input.width();
+                app.input_mode = InputMode::Editing;
+                app.items.unselect();
+            }
+        }
+    }
+
     //Strange
     fn handle_normal_mode_key_event_translate(
         &mut self,
@@ -1333,12 +1641,17 @@ impl LeChatPHPClient {
         app.items.state.select(Some(0));
     }
 
-    fn handle_editing_mode_key_event_enter(&mut self, app: &mut App) -> Result<(), ExitSignal> {
+    fn handle_editing_mode_key_event_enter(
+        &mut self,
+        app: &mut App,
+        users: &Arc<Mutex<Users>>,
+    ) -> Result<(), ExitSignal> {
         if FIND_RGX.is_match(&app.input) {
             return Ok(());
         }
 
-        let input: String = app.input.drain(..).collect();
+        let mut input: String = app.input.drain(..).collect();
+        input = replace_newline_escape(&input);
         app.input_idx = 0;
 
         // Iterate over commands and execute associated actions
@@ -1353,118 +1666,47 @@ impl LeChatPHPClient {
             }
         }
 
-        if input == "/dl" {
-            // Delete last message
-            self.post_msg(PostType::DeleteLast).unwrap();
-        } else if let Some(captures) = DLX_RGX.captures(&input) {
-            // Delete the last X messages
-            let x: usize = captures.get(1).unwrap().as_str().parse().unwrap();
-            for _ in 0..x {
-                self.post_msg(PostType::DeleteLast).unwrap();
+        let mut cmd_input = input.clone();
+        let mut members_prefix = false;
+        if cmd_input.starts_with("/m ") {
+            members_prefix = true;
+            if remove_prefix(&cmd_input, "/m ").starts_with('/') {
+                cmd_input = remove_prefix(&cmd_input, "/m ").to_owned();
             }
-        } else if input == "/dall" {
-            // Delete all messages
-            self.post_msg(PostType::DeleteAll).unwrap();
-        } else if input == "/cycles" {
-            self.color_tx.send(()).unwrap();
-        } else if input == "/cycle1" {
-            self.start_cycle(true);
-        } else if input == "/cycle2" {
-            self.start_cycle(false);
-        } else if input == "/kall" {
-            // Kick all guests
-            let username = "s _".to_owned();
-            let msg = "".to_owned();
-            self.post_msg(PostType::Kick(msg, username)).unwrap();
-        } else if input.starts_with("/m ") {
-            // Send message to "members" section
+        }
+
+        if self.process_command(&cmd_input, app, users) {
+            if members_prefix {
+                app.input = "/m ".to_owned();
+                app.input_idx = app.input.width();
+            }
+            return Ok(());
+        }
+
+        if members_prefix {
             let msg = remove_prefix(&input, "/m ").to_owned();
             let to = Some(SEND_TO_MEMBERS.to_owned());
             self.post_msg(PostType::Post(msg, to)).unwrap();
             app.input = "/m ".to_owned();
-            app.input_idx = app.input.width()
+            app.input_idx = app.input.width();
         } else if input.starts_with("/a ") {
-            // Send message to "admin" section
             let msg = remove_prefix(&input, "/a ").to_owned();
             let to = Some(SEND_TO_ADMINS.to_owned());
             self.post_msg(PostType::Post(msg, to)).unwrap();
             app.input = "/a ".to_owned();
-            app.input_idx = app.input.width()
+            app.input_idx = app.input.width();
         } else if input.starts_with("/s ") {
-            // Send message to "staff" section
             let msg = remove_prefix(&input, "/s ").to_owned();
             let to = Some(SEND_TO_STAFFS.to_owned());
             self.post_msg(PostType::Post(msg, to)).unwrap();
             app.input = "/s ".to_owned();
-            app.input_idx = app.input.width()
-        } else if let Some(captures) = PM_RGX.captures(&input) {
-            // Send PM message
-            let username = &captures[1];
-            let msg = captures[2].to_owned();
-            let to = Some(username.to_owned());
-            self.post_msg(PostType::Post(msg, to)).unwrap();
-            app.input = format!("/pm {} ", username);
-            app.input_idx = app.input.width()
-        } else if let Some(captures) = NEW_NICKNAME_RGX.captures(&input) {
-            // Change nickname
-            let new_nickname = captures[1].to_owned();
-            self.post_msg(PostType::NewNickname(new_nickname)).unwrap();
-        } else if let Some(captures) = NEW_COLOR_RGX.captures(&input) {
-            // Change color
-            let new_color = captures[1].to_owned();
-            self.post_msg(PostType::NewColor(new_color)).unwrap();
-        } else if let Some(captures) = KICK_RGX.captures(&input) {
-            // Kick a user
-            let username = captures[1].to_owned();
-            let msg = captures[2].to_owned();
-            self.post_msg(PostType::Kick(msg, username)).unwrap();
-        } else if let Some(captures) = IGNORE_RGX.captures(&input) {
-            // Ignore a user
-            let username = captures[1].to_owned();
-            self.post_msg(PostType::Ignore(username)).unwrap();
-        } else if let Some(captures) = UNIGNORE_RGX.captures(&input) {
-            // Unignore a user
-            let username = captures[1].to_owned();
-            self.post_msg(PostType::Unignore(username)).unwrap();
-        } else if let Some(captures) = UPLOAD_RGX.captures(&input) {
-            // Upload a file
-            let file_path = captures[1].to_owned();
-            let send_to = match captures.get(2) {
-                Some(to_match) => match to_match.as_str() {
-                    "members" => SEND_TO_MEMBERS,
-                    "staffs" => SEND_TO_STAFFS,
-                    "admins" => SEND_TO_ADMINS,
-                    _ => SEND_TO_ALL,
-                },
-                None => SEND_TO_ALL,
-            }
-            .to_owned();
-            let msg = match captures.get(3) {
-                Some(msg_match) => msg_match.as_str().to_owned(),
-                None => "".to_owned(),
-            };
-            self.post_msg(PostType::Upload(file_path, send_to, msg))
-                .unwrap();
-        } else if input.starts_with("!warn") {
-            // Strange
-            let msg: String = input
-                .find('@')
-                .map(|index| input[index..].to_string())
-                .unwrap_or_else(String::new);
-
-            let end_msg = format!(
-                "This is your warning - {}, will be kicked next  !rules",
-                msg
-            );
-            // log::error!("The Strange end_msg is :{}", end_msg);
-            self.post_msg(PostType::Post(end_msg, None)).unwrap();
+            app.input_idx = app.input.width();
         } else {
             if input.starts_with("/") && !input.starts_with("/me ") {
                 app.input_idx = input.len();
                 app.input = input;
                 app.input_mode = InputMode::EditingErr;
             } else {
-                // Send normal message
                 self.post_msg(PostType::Post(input, None)).unwrap();
             }
         }
@@ -1482,7 +1724,8 @@ impl LeChatPHPClient {
                     && ((parts[0] == "/kick" || parts[0] == "/k")
                         || parts[0] == "/pm"
                         || parts[0] == "/ignore"
-                        || parts[0] == "/unignore")
+                        || parts[0] == "/unignore"
+                        || parts[0] == "/ban")
                 {
                     should_autocomplete = true;
                 } else if user_prefix.starts_with("@") {
@@ -1553,8 +1796,14 @@ impl LeChatPHPClient {
         if let Ok(clipboard) = ctx.get_contents() {
             let byte_position = byte_pos(&app.input, app.input_idx).unwrap();
             app.input.insert_str(byte_position, &clipboard);
-            app.input_idx += clipboard.width();
+            app.input_idx += clipboard.chars().count();
         }
+    }
+
+    fn handle_editing_mode_key_event_newline(&mut self, app: &mut App) {
+        let byte_position = byte_pos(&app.input, app.input_idx).unwrap();
+        app.input.insert(byte_position, '\n');
+        app.input_idx += 1;
     }
 
     fn handle_editing_mode_key_event_left(&mut self, app: &mut App) {
@@ -1889,6 +2138,10 @@ fn get_msgs(
     datetime_fmt: &str,
     messages: &Arc<Mutex<Vec<Message>>>,
     should_notify: &mut bool,
+    tx: &crossbeam_channel::Sender<PostType>,
+    bad_usernames: &Arc<Mutex<Vec<String>>>,
+    bad_exact_usernames: &Arc<Mutex<Vec<String>>>,
+    bad_messages: &Arc<Mutex<Vec<String>>>,
 ) -> anyhow::Result<()> {
     let url = format!(
         "{}/{}?action=view&session={}&lang={}",
@@ -1905,6 +2158,21 @@ fn get_msgs(
             return Ok(());
         }
     };
+    let current_users = extract_users(&doc);
+    {
+        let previous = users.lock().unwrap();
+        let filters = bad_usernames.lock().unwrap();
+        let exact_filters = bad_exact_usernames.lock().unwrap();
+        for (_, name) in &current_users.guests {
+            if !previous.guests.iter().any(|(_, n)| n == name) {
+                if exact_filters.iter().any(|f| f == name)
+                    || filters.iter().any(|f| name.to_lowercase().contains(&f.to_lowercase()))
+                {
+                    let _ = tx.send(PostType::Kick(String::new(), name.clone()));
+                }
+            }
+        }
+    }
     {
         let messages = messages.lock().unwrap();
         process_new_messages(
@@ -1914,6 +2182,11 @@ fn get_msgs(
             members_tag,
             username,
             should_notify,
+            &current_users,
+            tx,
+            bad_usernames,
+            bad_exact_usernames,
+            bad_messages,
         );
         // Build messages vector. Tag deleted messages.
         update_messages(new_messages, messages, datetime_fmt);
@@ -1923,8 +2196,8 @@ fn get_msgs(
         messages_updated_tx.send(()).unwrap();
     }
     {
-        let mut users = users.lock().unwrap();
-        *users = extract_users(&doc);
+        let mut u = users.lock().unwrap();
+        *u = current_users;
     }
     Ok(())
 }
@@ -1936,6 +2209,11 @@ fn process_new_messages(
     members_tag: &str,
     username: &str,
     should_notify: &mut bool,
+    users: &Users,
+    tx: &crossbeam_channel::Sender<PostType>,
+    bad_usernames: &Arc<Mutex<Vec<String>>>,
+    bad_exact_usernames: &Arc<Mutex<Vec<String>>>,
+    bad_messages: &Arc<Mutex<Vec<String>>>,
 ) {
     if let Some(last_known_msg) = messages.first() {
         let last_known_msg_parsed_dt = parse_date(&last_known_msg.date, datetime_fmt);
@@ -1944,17 +2222,60 @@ fn process_new_messages(
                 && !(new_msg.date == last_known_msg.date && last_known_msg.text == new_msg.text)
         });
         for new_msg in filtered {
-            if let Some((_, to_opt, msg)) = get_message(&new_msg.text, members_tag) {
-                // Process new messages
-
+            if let Some((from, to_opt, msg)) = get_message(&new_msg.text, members_tag) {
                 // Notify when tagged
                 if msg.contains(format!("@{}", &username).as_str()) {
                     *should_notify = true;
                 }
-                // Notify when PM is received
-                if let Some(to) = to_opt {
+                if let Some(ref to) = to_opt {
                     if to == username && msg != "!up" {
                         *should_notify = true;
+                    }
+                }
+
+                let is_guest = users.guests.iter().any(|(_, n)| n == &from);
+                if from != username && is_guest {
+                    let bad_name = {
+                        let filters = bad_usernames.lock().unwrap();
+                        filters.iter().any(|f| from.to_lowercase().contains(&f.to_lowercase()))
+                    };
+                    let bad_name_exact = {
+                        let filters = bad_exact_usernames.lock().unwrap();
+                        filters.iter().any(|f| f == &from)
+                    };
+                    let bad_msg = {
+                        let filters = bad_messages.lock().unwrap();
+                        filters.iter().any(|f| msg.to_lowercase().contains(&f.to_lowercase()))
+                    };
+
+                    if bad_name_exact || bad_name || bad_msg {
+                        let _ = tx.send(PostType::Kick(String::new(), from.clone()));
+                    } else {
+                        let res = score_message(&msg);
+                        if let Some(act) = action_from_score(res.score) {
+                            match act {
+                                Action::Warn => {
+                                    if to_opt.is_none() {
+                                        let reason = res
+                                            .reason
+                                            .map(|r| r.description())
+                                            .unwrap_or("breaking the rules");
+                                        let warn = format!(
+                                            "@{username} - @{from}'s message was flagged for {reason}."
+                                        );
+                                        let _ = tx.send(PostType::Post(warn, Some("0".to_owned())));
+                                    }
+                                }
+                                Action::Kick => {
+                                    let _ = tx.send(PostType::Kick(String::new(), from.clone()));
+                                }
+                                Action::Ban => {
+                                    let _ = tx.send(PostType::Kick(String::new(), from.clone()));
+                                    let mut f = bad_usernames.lock().unwrap();
+                                    f.push(from.clone());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2100,6 +2421,9 @@ fn new_default_le_chat_php_client(params: Params) -> LeChatPHPClient {
         rx: Arc::new(Mutex::new(rx)),
         color_tx,
         color_rx: Arc::new(Mutex::new(color_rx)),
+        bad_username_filters: Arc::new(Mutex::new(params.bad_usernames)),
+        bad_exact_username_filters: Arc::new(Mutex::new(params.bad_exact_usernames)),
+        bad_message_filters: Arc::new(Mutex::new(params.bad_messages)),
     }
 }
 
@@ -2123,6 +2447,9 @@ struct Params {
     max_login_retry: isize,
     keepalive_send_to: Option<String>,
     session: Option<String>,
+    bad_usernames: Vec<String>,
+    bad_exact_usernames: Vec<String>,
+    bad_messages: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -2162,6 +2489,10 @@ fn trim_newline(s: &mut String) {
             s.pop();
         }
     }
+}
+
+fn replace_newline_escape(s: &str) -> String {
+    s.replace("\\n", "\n")
 }
 
 fn get_guest_color(wanted: Option<String>) -> String {
@@ -2360,6 +2691,12 @@ fn main() -> anyhow::Result<()> {
                 opts.password = Some(default_profile.password.clone());
             }
         }
+        let bad_usernames = cfg.bad_usernames.clone();
+        let bad_exact_usernames = cfg.bad_exact_usernames.clone();
+        let bad_messages = cfg.bad_messages.clone();
+        opts.bad_usernames = Some(bad_usernames);
+        opts.bad_exact_usernames = Some(bad_exact_usernames);
+        opts.bad_messages = Some(bad_messages);
     }
 
     let logfile = FileAppender::builder()
@@ -2406,6 +2743,9 @@ fn main() -> anyhow::Result<()> {
         max_login_retry: opts.max_login_retry,
         keepalive_send_to: opts.keepalive_send_to,
         session: opts.session.clone(),
+        bad_usernames: opts.bad_usernames.unwrap_or_default(),
+        bad_exact_usernames: opts.bad_exact_usernames.unwrap_or_default(),
+        bad_messages: opts.bad_messages.unwrap_or_default(),
     };
     // println!("Session[2378]: {:?}", opts.session);
 
