@@ -37,6 +37,7 @@ use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::io::{self, Write};
+use std::fs::OpenOptions;
 use std::process::Command;
 use std::sync::Mutex;
 use std::sync::{Arc, MutexGuard};
@@ -2222,6 +2223,7 @@ fn process_new_messages(
                 && !(new_msg.date == last_known_msg.date && last_known_msg.text == new_msg.text)
         });
         for new_msg in filtered {
+            log_chat_message(new_msg);
             if let Some((from, to_opt, msg)) = get_message(&new_msg.text, members_tag) {
                 // Notify when tagged
                 if msg.contains(format!("@{}", &username).as_str()) {
@@ -2332,6 +2334,17 @@ fn update_messages(
         }
     }
     messages.truncate(1000);
+}
+
+fn log_chat_message(msg: &Message) {
+    if let Ok(path) = confy::get_configuration_file_path("bhcli", None) {
+        if let Some(dir) = path.parent() {
+            let log_path = dir.join("chat-log.txt");
+            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log_path) {
+                let _ = writeln!(f, "{} - {}", msg.date, msg.text.text());
+            }
+        }
+    }
 }
 
 fn delete_message(
