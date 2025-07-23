@@ -122,6 +122,8 @@ struct MyConfig {
     #[serde(default)]
     bad_messages: Vec<String>,
     #[serde(default)]
+    allowlist: Vec<String>,
+    #[serde(default)]
     commands: HashMap<String, String>,
     profiles: HashMap<String, Profile>,
 }
@@ -188,6 +190,8 @@ struct Opts {
     bad_exact_usernames: Option<Vec<String>>,
     #[arg(skip)]
     bad_messages: Option<Vec<String>>,
+    #[arg(skip)]
+    allowlist: Option<Vec<String>>,
 }
 
 struct LeChatPHPConfig {
@@ -243,6 +247,7 @@ struct LeChatPHPClient {
     bad_username_filters: Arc<Mutex<Vec<String>>>,
     bad_exact_username_filters: Arc<Mutex<Vec<String>>>,
     bad_message_filters: Arc<Mutex<Vec<String>>>,
+    allowlist: Arc<Mutex<Vec<String>>>,
 }
 
 impl LeChatPHPClient {
@@ -318,11 +323,11 @@ impl LeChatPHPClient {
         let send_to = self.config.keepalive_send_to.clone();
         thread::spawn(move || loop {
             let clb = || {
-                tx.send(PostType::Post("<keepalive>".to_owned(), Some(send_to.clone())))
+                tx.send(PostType::Post("keep alive".to_owned(), Some(send_to.clone())))
                     .unwrap();
                 tx.send(PostType::DeleteLast).unwrap();
             };
-            let timeout = after(Duration::from_secs(60 * 75));
+            let timeout = after(Duration::from_secs(60 * 55));
             select! {
                 // Whenever we send a message to chat server,
                 // we will receive a message on this channel
@@ -391,6 +396,7 @@ impl LeChatPHPClient {
         let bad_usernames = Arc::clone(&self.bad_username_filters);
         let bad_exact_usernames = Arc::clone(&self.bad_exact_username_filters);
         let bad_messages = Arc::clone(&self.bad_message_filters);
+        let allowlist = Arc::clone(&self.allowlist);
         thread::spawn(move || loop {
             let (_stream, stream_handle) = OutputStream::try_default().unwrap();
             let source = Decoder::new_mp3(Cursor::new(SOUND1)).unwrap();
@@ -413,6 +419,7 @@ impl LeChatPHPClient {
                 &bad_usernames,
                 &bad_exact_usernames,
                 &bad_messages,
+                &allowlist,
             ) {
                 log::error!("{}", err);
             };
@@ -596,6 +603,7 @@ impl LeChatPHPClient {
             cfg.bad_usernames = self.bad_username_filters.lock().unwrap().clone();
             cfg.bad_exact_usernames = self.bad_exact_username_filters.lock().unwrap().clone();
             cfg.bad_messages = self.bad_message_filters.lock().unwrap().clone();
+            cfg.allowlist = self.allowlist.lock().unwrap().clone();
             if let Err(e) = confy::store("bhcli", None, cfg) {
                 log::error!("failed to store config: {}", e);
             }
@@ -776,6 +784,33 @@ impl LeChatPHPClient {
                 let msg = format!("Unfiltered \"{}\"", term);
                 self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
             }
+        } else if input.starts_with("/allow ") {
+            let user = remove_prefix(input, "/allow ").to_owned();
+            {
+                let mut list = self.allowlist.lock().unwrap();
+                if !list.contains(&user) {
+                    list.push(user.clone());
+                }
+            }
+            self.save_filters();
+            let msg = format!("Allowed {}", user);
+            self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+        } else if input.starts_with("/revoke ") {
+            let user = remove_prefix(input, "/revoke ").to_owned();
+            {
+                let mut list = self.allowlist.lock().unwrap();
+                if let Some(pos) = list.iter().position(|u| u == &user) {
+                    list.remove(pos);
+                }
+            }
+            self.save_filters();
+            let msg = format!("Revoked {}", user);
+            self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+        } else if input == "/allowlist" {
+            let list = self.allowlist.lock().unwrap().clone();
+            let out = if list.is_empty() { String::from("(empty)") } else { list.join(", ") };
+            let msg = format!("Allowlist: {}", out);
+            self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
         } else if let Some(captures) = IGNORE_RGX.captures(input) {
             let username = captures[1].to_owned();
             self.post_msg(PostType::Ignore(username)).unwrap();
@@ -2143,6 +2178,7 @@ fn get_msgs(
     bad_usernames: &Arc<Mutex<Vec<String>>>,
     bad_exact_usernames: &Arc<Mutex<Vec<String>>>,
     bad_messages: &Arc<Mutex<Vec<String>>>,
+    allowlist: &Arc<Mutex<Vec<String>>>,
 ) -> anyhow::Result<()> {
     let url = format!(
         "{}/{}?action=view&session={}&lang={}",
@@ -2188,6 +2224,7 @@ fn get_msgs(
             bad_usernames,
             bad_exact_usernames,
             bad_messages,
+            allowlist,
         );
         // Build messages vector. Tag deleted messages.
         update_messages(new_messages, messages, datetime_fmt);
@@ -2215,6 +2252,7 @@ fn process_new_messages(
     bad_usernames: &Arc<Mutex<Vec<String>>>,
     bad_exact_usernames: &Arc<Mutex<Vec<String>>>,
     bad_messages: &Arc<Mutex<Vec<String>>>,
+    allowlist: &Arc<Mutex<Vec<String>>>,
 ) {
     if let Some(last_known_msg) = messages.first() {
         let last_known_msg_parsed_dt = parse_date(&last_known_msg.date, datetime_fmt);
@@ -2232,6 +2270,38 @@ fn process_new_messages(
                 if let Some(ref to) = to_opt {
                     if to == username && msg != "!up" {
                         *should_notify = true;
+                    }
+                }
+
+                // Remote moderation handling
+                let is_member_or_staff = users.members.iter().any(|(_, n)| n == &from)
+                    || users.staff.iter().any(|(_, n)| n == &from)
+                    || users.admin.iter().any(|(_, n)| n == &from);
+                let allowed_guest = {
+                    let list = allowlist.lock().unwrap();
+                    list.contains(&from)
+                };
+                let directed_to_me = to_opt.as_ref().map(|t| t == username).unwrap_or(false);
+                let via_members = new_msg.text.text().starts_with(members_tag);
+                let has_permission = is_member_or_staff || allowed_guest;
+                if msg.starts_with("#kick ") || msg.starts_with("#ban ") {
+                    if has_permission && (directed_to_me || via_members) {
+                        if let Some(target) = msg.strip_prefix("#kick ") {
+                            let user = target.trim().trim_start_matches('@');
+                            if !user.is_empty() {
+                                let _ = tx.send(PostType::Kick(String::new(), user.to_owned()));
+                            }
+                        } else if let Some(target) = msg.strip_prefix("#ban ") {
+                            let user = target.trim().trim_start_matches('@');
+                            if !user.is_empty() {
+                                let _ = tx.send(PostType::Kick(String::new(), user.to_owned()));
+                                let mut f = bad_usernames.lock().unwrap();
+                                f.push(user.to_owned());
+                            }
+                        }
+                    } else if directed_to_me && !has_permission {
+                        let msg = "You don't have permission to do that.".to_owned();
+                        let _ = tx.send(PostType::Post(msg, Some(from.clone())));
                     }
                 }
 
@@ -2437,6 +2507,7 @@ fn new_default_le_chat_php_client(params: Params) -> LeChatPHPClient {
         bad_username_filters: Arc::new(Mutex::new(params.bad_usernames)),
         bad_exact_username_filters: Arc::new(Mutex::new(params.bad_exact_usernames)),
         bad_message_filters: Arc::new(Mutex::new(params.bad_messages)),
+        allowlist: Arc::new(Mutex::new(params.allowlist)),
     }
 }
 
@@ -2463,6 +2534,7 @@ struct Params {
     bad_usernames: Vec<String>,
     bad_exact_usernames: Vec<String>,
     bad_messages: Vec<String>,
+    allowlist: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -2707,9 +2779,11 @@ fn main() -> anyhow::Result<()> {
         let bad_usernames = cfg.bad_usernames.clone();
         let bad_exact_usernames = cfg.bad_exact_usernames.clone();
         let bad_messages = cfg.bad_messages.clone();
+        let allowlist_cfg = cfg.allowlist.clone();
         opts.bad_usernames = Some(bad_usernames);
         opts.bad_exact_usernames = Some(bad_exact_usernames);
         opts.bad_messages = Some(bad_messages);
+        opts.allowlist = Some(allowlist_cfg);
     }
 
     let logfile = FileAppender::builder()
@@ -2759,6 +2833,7 @@ fn main() -> anyhow::Result<()> {
         bad_usernames: opts.bad_usernames.unwrap_or_default(),
         bad_exact_usernames: opts.bad_exact_usernames.unwrap_or_default(),
         bad_messages: opts.bad_messages.unwrap_or_default(),
+        allowlist: opts.allowlist.unwrap_or_default(),
     };
     // println!("Session[2378]: {:?}", opts.session);
 
