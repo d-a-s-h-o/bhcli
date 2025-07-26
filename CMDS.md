@@ -29,6 +29,6 @@
 - `Shift+Y` copy first link in message
 - `m` toggle notifications
 - `Shift+G` guest view
-- `Shift+M` members view
+- `Shift+M` members view (Dexter: show PMs from Dasho)
 - `Ctrl+D`/`PageDown` scroll down
 - `Ctrl+U`/`PageUp` scroll up
