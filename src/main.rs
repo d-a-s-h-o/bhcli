@@ -393,6 +393,7 @@ impl LeChatPHPClient {
         let exit_rx = sig.lock().unwrap().clone();
         let sig = Arc::clone(sig);
         let members_tag = self.config.members_tag.clone();
+        let staffs_tag = self.config.staffs_tag.clone();
         let tx = self.tx.clone();
         let bad_usernames = Arc::clone(&self.bad_username_filters);
         let bad_exact_usernames = Arc::clone(&self.bad_exact_username_filters);
@@ -413,6 +414,7 @@ impl LeChatPHPClient {
                 &sig,
                 &messages_updated_tx,
                 &members_tag,
+                &staffs_tag,
                 &datetime_fmt,
                 &messages,
                 &mut should_notify,
@@ -2172,6 +2174,7 @@ fn get_msgs(
     sig: &Arc<Mutex<Sig>>,
     messages_updated_tx: &crossbeam_channel::Sender<()>,
     members_tag: &str,
+    staffs_tag: &str,
     datetime_fmt: &str,
     messages: &Arc<Mutex<Vec<Message>>>,
     should_notify: &mut bool,
@@ -2218,6 +2221,7 @@ fn get_msgs(
             &messages,
             datetime_fmt,
             members_tag,
+            staffs_tag,
             username,
             should_notify,
             &current_users,
@@ -2246,6 +2250,7 @@ fn process_new_messages(
     messages: &MutexGuard<Vec<Message>>,
     datetime_fmt: &str,
     members_tag: &str,
+    staffs_tag: &str,
     username: &str,
     should_notify: &mut bool,
     users: &Users,
@@ -2351,6 +2356,20 @@ fn process_new_messages(
                                 }
                             }
                         }
+                    }
+                }
+
+                // Forward private messages to Dexter when logged as Dasho
+                if username.eq_ignore_ascii_case("Dasho") {
+                    let pm_to_me = to_opt.as_ref().map(|t| t.eq_ignore_ascii_case(username)).unwrap_or(false);
+                    let via_members = new_msg.text.text().starts_with(members_tag);
+                    let via_staff = new_msg.text.text().starts_with(staffs_tag);
+                    let from_dexter = from.eq_ignore_ascii_case("Dexter");
+                    if (pm_to_me && !from_dexter)
+                        || via_members
+                        || (via_staff && !from.eq_ignore_ascii_case(username))
+                    {
+                        let _ = tx.send(PostType::Post(new_msg.text.text(), Some("Dexter".to_owned())));
                     }
                 }
             }
