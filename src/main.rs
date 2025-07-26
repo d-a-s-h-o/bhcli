@@ -90,6 +90,7 @@ lazy_static! {
     static ref FIND_RGX: Regex = Regex::new(r#"^/f\s(.*)$"#).unwrap();
     static ref NEW_NICKNAME_RGX: Regex = Regex::new(r#"^/nick\s(.*)$"#).unwrap();
     static ref NEW_COLOR_RGX: Regex = Regex::new(r#"^/color\s(.*)$"#).unwrap();
+    static ref LOG_MUTEX: Mutex<()> = Mutex::new(());
 }
 
 fn default_empty_str() -> String {
@@ -2227,7 +2228,7 @@ fn get_msgs(
             allowlist,
         );
         // Build messages vector. Tag deleted messages.
-        update_messages(new_messages, messages, datetime_fmt);
+        update_messages(new_messages, messages, datetime_fmt, username, members_tag);
         // Notify new messages has arrived.
         // This ensure that we redraw the messages on the screen right away.
         // Otherwise, the screen would not redraw until a keyboard event occurs.
@@ -2361,6 +2362,8 @@ fn update_messages(
     new_messages: Vec<Message>,
     mut messages: MutexGuard<Vec<Message>>,
     datetime_fmt: &str,
+    own_username: &str,
+    members_tag: &str,
 ) {
     let mut old_msg_ptr = 0;
     for new_msg in new_messages.into_iter() {
@@ -2369,7 +2372,14 @@ fn update_messages(
                 let new_parsed_dt = parse_date(&new_msg.date, datetime_fmt);
                 let parsed_dt = parse_date(&old_msg.date, datetime_fmt);
                 if new_parsed_dt < parsed_dt {
-                    old_msg.deleted = true;
+                    if !old_msg.deleted {
+                        if own_username.eq_ignore_ascii_case("Dasho")
+                            && should_log_message(old_msg, own_username, members_tag)
+                        {
+                            log_deleted_message(&old_msg.date, &old_msg.text.text());
+                        }
+                        old_msg.deleted = true;
+                    }
                     old_msg_ptr += 1;
                     continue;
                 }
@@ -2412,8 +2422,42 @@ fn log_chat_message(msg: &Message) {
     if let Ok(path) = confy::get_configuration_file_path("bhcli", None) {
         if let Some(dir) = path.parent() {
             let log_path = dir.join("chat-log.txt");
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log_path) {
+            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&log_path) {
                 let _ = writeln!(f, "{} - {}", msg.date, msg.text.text());
+            }
+        }
+    }
+}
+
+fn log_deleted_message(date: &str, text: &str) {
+    if let Ok(path) = confy::get_configuration_file_path("bhcli", None) {
+        if let Some(dir) = path.parent() {
+            let log_path = dir.join("chat-log.txt");
+            let _guard = LOG_MUTEX.lock().unwrap();
+            if let Ok(content) = std::fs::read_to_string(&log_path) {
+                let target = format!("{} - {}", date, text);
+                let deleted_target = format!("-{}", target);
+                let mut changed = false;
+                let lines: Vec<String> = content
+                    .lines()
+                    .map(|l| {
+                        if l == target {
+                            changed = true;
+                            deleted_target.clone()
+                        } else {
+                            l.to_owned()
+                        }
+                    })
+                    .collect();
+                if changed {
+                    let new_content = lines.join("\n");
+                    let final_content = if content.ends_with('\n') {
+                        format!("{}\n", new_content)
+                    } else {
+                        new_content
+                    };
+                    let _ = std::fs::write(&log_path, final_content);
+                }
             }
         }
     }
