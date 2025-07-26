@@ -238,6 +238,7 @@ struct LeChatPHPClient {
     show_sys: bool,
     display_guest_view: bool,
     display_member_view: bool,
+    display_pm_view: bool,
     display_hidden_msgs: bool,
     tx: crossbeam_channel::Sender<PostType>,
     rx: Arc<Mutex<crossbeam_channel::Receiver<PostType>>>,
@@ -485,6 +486,7 @@ impl LeChatPHPClient {
             app.show_sys = self.show_sys;
             app.display_guest_view = self.display_guest_view;
             app.display_member_view = self.display_member_view;
+            app.display_pm_view = self.display_pm_view;
             app.display_hidden_msgs = self.display_hidden_msgs;
             app.members_tag = self.config.members_tag.clone();
             app.staffs_tag = self.config.staffs_tag.clone();
@@ -1130,6 +1132,11 @@ impl LeChatPHPClient {
                 ..
             } => self.handle_normal_mode_key_event_shift_v(app, messages),
             KeyEvent {
+                code: KeyCode::Char('P'),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => self.handle_normal_mode_key_event_shift_p(app),
+            KeyEvent {
                 code: KeyCode::Char('u'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
@@ -1524,16 +1531,19 @@ impl LeChatPHPClient {
         self.display_member_view = !self.display_member_view;
     }
 
+    fn handle_normal_mode_key_event_shift_p(&mut self, app: &mut App) {
+        if self.base_client.username.eq_ignore_ascii_case("Dexter") {
+            self.display_pm_view = !self.display_pm_view;
+            app.items.state.select(Some(0));
+        }
+    }
+
     fn handle_normal_mode_key_event_shift_m(
         &mut self,
         app: &mut App,
         messages: &Arc<Mutex<Vec<Message>>>,
     ) {
-        if self
-            .base_client
-            .username
-            .eq_ignore_ascii_case("Dexter")
-        {
+        if self.base_client.username.eq_ignore_ascii_case("Dexter") {
             let msgs = messages.lock().unwrap();
             let mut lines = Vec::new();
             for m in msgs.iter() {
@@ -2873,6 +2883,7 @@ fn new_default_le_chat_php_client(params: Params) -> LeChatPHPClient {
         show_sys: false,
         display_guest_view: false,
         display_member_view: false,
+        display_pm_view: false,
         display_hidden_msgs: false,
         tx,
         rx: Arc::new(Mutex::new(rx)),
@@ -3592,7 +3603,7 @@ fn draw_terminal_frame(
 
             render_help_txt(f, app, chunks[0], username);
             render_textbox(f, app, chunks[1]);
-            render_messages(f, app, chunks[2], messages);
+            render_messages(f, app, chunks[2], messages, username);
             render_users(f, hchunks[1], users);
         }
     } else {
@@ -3769,6 +3780,16 @@ fn render_help_txt(
         msg.extend(vec![Span::raw(" | "), Span::styled("M", style)]);
     }
 
+    if app.display_pm_view {
+        let fg = tuiColor::LightGreen;
+        let style = Style::default().fg(fg).add_modifier(Modifier::BOLD);
+        msg.extend(vec![Span::raw(" | "), Span::styled("P", style)]);
+    } else {
+        let fg = tuiColor::Gray;
+        let style = Style::default().fg(fg);
+        msg.extend(vec![Span::raw(" | "), Span::styled("P", style)]);
+    }
+
     if app.display_hidden_msgs {
         let fg = tuiColor::LightGreen;
         let style = Style::default().fg(fg).add_modifier(Modifier::BOLD);
@@ -3825,6 +3846,7 @@ fn render_messages(
     app: &mut App,
     r: Rect,
     messages: &Arc<Mutex<Vec<Message>>>,
+    username: &str,
 ) {
     // Messages
     app.items.items.clear();
@@ -3857,6 +3879,17 @@ fn render_messages(
                 }
                 if let Some((_, Some(_), _)) = get_message(&m.text, &app.members_tag) {
                     return None;
+                }
+            }
+
+            if app.display_pm_view {
+                match get_message(&m.text, &app.members_tag) {
+                    Some((_, Some(to), _)) => {
+                        if !to.eq_ignore_ascii_case(username) {
+                            return None;
+                        }
+                    }
+                    _ => return None,
                 }
             }
 
@@ -3965,6 +3998,7 @@ struct App {
     show_sys: bool,
     display_guest_view: bool,
     display_member_view: bool,
+    display_pm_view: bool,
     display_hidden_msgs: bool,
     items: StatefulList<Message>,
     filter: String,
@@ -4014,6 +4048,7 @@ impl Default for App {
             show_sys: false,
             display_guest_view: false,
             display_member_view: false,
+            display_pm_view: false,
             display_hidden_msgs: false,
             items: StatefulList::new(),
             filter: "".to_owned(),
