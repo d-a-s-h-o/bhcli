@@ -1535,6 +1535,8 @@ impl LeChatPHPClient {
             {
                 if text.text().starts_with(&app.members_tag) {
                     app.input = format!("/m @{} ", username);
+                } else if text.text().starts_with(&app.staffs_tag) {
+                    app.input = format!("/s @{} ", username);
                 } else {
                     app.input = format!("@{} ", username);
                 }
