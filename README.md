@@ -56,6 +56,7 @@ Pre-buit binaries can be found on the [official website](http://git.dkforestseea
 - Download an embedded file and open it with xdg-open into cwd with `D`
 - `shift + T` for translating text to english. [ must have translate-shell installed on arch or debain ]
     > pacman -S translate-shell
+- View Dasho staff PMs when logged in as Dexter `shift+V`
 - Custom personal command creation for members+ [ read Command Creation ]
 
 ### Editing mode
