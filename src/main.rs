@@ -2263,7 +2263,7 @@ fn process_new_messages(
         });
         for new_msg in filtered {
             if should_log_message(new_msg, username, members_tag) {
-                log_chat_message(new_msg);
+                log_chat_message(new_msg, username);
             }
             if let Some((from, to_opt, msg)) = get_message(&new_msg.text, members_tag) {
                 // Notify when tagged
@@ -2418,12 +2418,29 @@ fn update_messages(
     messages.truncate(1000);
 }
 
-fn log_chat_message(msg: &Message) {
+fn log_chat_message(msg: &Message, username: &str) {
     if let Ok(path) = confy::get_configuration_file_path("bhcli", None) {
         if let Some(dir) = path.parent() {
             let log_path = dir.join("chat-log.txt");
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&log_path) {
-                let _ = writeln!(f, "{} - {}", msg.date, msg.text.text());
+            let target = format!("{} - {}", msg.date, msg.text.text());
+            if username.eq_ignore_ascii_case("Dasho") {
+                let deleted_target = format!("-{}", target);
+                let _guard = LOG_MUTEX.lock().unwrap();
+                let mut should_write = true;
+                if let Ok(content) = std::fs::read_to_string(&log_path) {
+                    should_write = !content
+                        .lines()
+                        .any(|l| l == target || l == deleted_target);
+                }
+                if should_write {
+                    if let Ok(mut f) =
+                        OpenOptions::new().create(true).append(true).open(&log_path)
+                    {
+                        let _ = writeln!(f, "{}", target);
+                    }
+                }
+            } else if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&log_path) {
+                let _ = writeln!(f, "{}", target);
             }
         }
     }
