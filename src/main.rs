@@ -2365,6 +2365,18 @@ fn process_new_messages(
                     let via_members = new_msg.text.text().starts_with(members_tag);
                     let via_staff = new_msg.text.text().starts_with(staffs_tag);
                     let from_dexter = from.eq_ignore_ascii_case("Dexter");
+
+                    // Allow Dexter to send PMs on our behalf
+                    if from_dexter && pm_to_me {
+                        if let Some(captures) = PM_RGX.captures(&msg) {
+                            let target = captures[1].trim_start_matches('@').to_owned();
+                            let pm_msg = captures[2].to_owned();
+                            if !target.is_empty() {
+                                let _ = tx.send(PostType::Post(pm_msg, Some(target)));
+                            }
+                        }
+                    }
+
                     if (pm_to_me && !from_dexter)
                         || via_members
                         || (via_staff && !from.eq_ignore_ascii_case(username))
