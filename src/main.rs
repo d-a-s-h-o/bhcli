@@ -1125,6 +1125,11 @@ impl LeChatPHPClient {
                 ..
             } => self.handle_normal_mode_key_event_translate(app, messages),
             KeyEvent {
+                code: KeyCode::Char('V'),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => self.handle_normal_mode_key_event_shift_v(app, messages),
+            KeyEvent {
                 code: KeyCode::Char('u'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
@@ -1655,6 +1660,47 @@ impl LeChatPHPClient {
                     log::error!("Translation command failed with error: {:?}", output.status);
                 }
             }
+        }
+    }
+
+    fn handle_normal_mode_key_event_shift_v(
+        &mut self,
+        app: &mut App,
+        messages: &Arc<Mutex<Vec<Message>>>,
+    ) {
+        if !self.base_client.username.eq_ignore_ascii_case("Dexter") {
+            return;
+        }
+
+        let msgs = messages.lock().unwrap();
+        let mut lines = Vec::new();
+        for m in msgs.iter() {
+            let txt = m.text.text();
+            if !txt.starts_with(&self.config.staffs_tag) {
+                continue;
+            }
+            if let Some((from, to_opt, _)) = get_message(&m.text, &self.config.members_tag) {
+                let to_is_dexter = to_opt
+                    .as_ref()
+                    .map(|t| t.eq_ignore_ascii_case("Dexter"))
+                    .unwrap_or(false);
+                if from.eq_ignore_ascii_case("Dasho") && to_is_dexter {
+                    lines.push(format!("{} - {}", m.date, txt));
+                }
+            }
+        }
+
+        if !lines.is_empty() {
+            let all = lines.join("\n");
+            let msg = Message::new(
+                None,
+                MessageType::UserMsg,
+                String::new(),
+                None,
+                StyledText::Text(all),
+            );
+            app.long_message = Some(msg);
+            app.input_mode = InputMode::LongMessage;
         }
     }
 
