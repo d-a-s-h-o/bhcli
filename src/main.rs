@@ -2261,7 +2261,9 @@ fn process_new_messages(
                 && !(new_msg.date == last_known_msg.date && last_known_msg.text == new_msg.text)
         });
         for new_msg in filtered {
-            log_chat_message(new_msg);
+            if should_log_message(new_msg, username, members_tag) {
+                log_chat_message(new_msg);
+            }
             if let Some((from, to_opt, msg)) = get_message(&new_msg.text, members_tag) {
                 // Notify when tagged
                 if msg.contains(format!("@{}", &username).as_str()) {
@@ -2415,6 +2417,19 @@ fn log_chat_message(msg: &Message) {
             }
         }
     }
+}
+
+fn should_log_message(msg: &Message, own_username: &str, members_tag: &str) -> bool {
+    if own_username.eq_ignore_ascii_case("Dasho") {
+        if let Some((from, to_opt, _)) = get_message(&msg.text, members_tag) {
+            if let Some(to) = to_opt {
+                if to.eq_ignore_ascii_case("Dexter") || from.eq_ignore_ascii_case("Dexter") {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 fn delete_message(
