@@ -323,6 +323,11 @@ impl LeChatPHPClient {
     ) -> thread::JoinHandle<()> {
         let tx = self.tx.clone();
         let send_to = self.config.keepalive_send_to.clone();
+        let timeout_secs = if self.base_client.username.eq_ignore_ascii_case("Dexter") {
+            60 * 25
+        } else {
+            60 * 55
+        };
         thread::spawn(move || loop {
             let clb = || {
                 tx.send(PostType::Post(
@@ -332,7 +337,7 @@ impl LeChatPHPClient {
                 .unwrap();
                 tx.send(PostType::DeleteLast).unwrap();
             };
-            let timeout = after(Duration::from_secs(60 * 55));
+            let timeout = after(Duration::from_secs(timeout_secs));
             select! {
                 // Whenever we send a message to chat server,
                 // we will receive a message on this channel
