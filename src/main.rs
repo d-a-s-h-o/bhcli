@@ -86,6 +86,7 @@ lazy_static! {
     static ref IGNORE_RGX: Regex = Regex::new(r#"^/ignore ([^\s]+)"#).unwrap();
     static ref UNIGNORE_RGX: Regex = Regex::new(r#"^/unignore ([^\s]+)"#).unwrap();
     static ref DLX_RGX: Regex = Regex::new(r#"^/dl([\d]+)$"#).unwrap();
+    static ref DELETE_RGX: Regex = Regex::new(r#"^/delete (\d+)"#).unwrap();
     static ref UPLOAD_RGX: Regex = Regex::new(r#"^/u\s([^\s]+)\s?(?:@([^\s]+)\s)?(.*)$"#).unwrap();
     static ref FIND_RGX: Regex = Regex::new(r#"^/f\s(.*)$"#).unwrap();
     static ref NEW_NICKNAME_RGX: Regex = Regex::new(r#"^/nick\s(.*)$"#).unwrap();
@@ -263,6 +264,7 @@ struct LeChatPHPClient {
     display_pm_only: bool,
     display_staff_view: bool,
     display_master_pm_view: bool,
+    clean_mode: bool,
 }
 
 impl LeChatPHPClient {
@@ -502,6 +504,7 @@ impl LeChatPHPClient {
             app.display_pm_only = self.display_pm_only;
             app.display_staff_view = self.display_staff_view;
             app.display_master_pm_view = self.display_master_pm_view;
+            app.clean_mode = self.clean_mode;
             app.alt_account = self.alt_account.clone();
             app.master_account = self.master_account.clone();
             app.members_tag = self.config.members_tag.clone();
@@ -730,6 +733,9 @@ impl LeChatPHPClient {
             }
         } else if input == "/dall" {
             self.post_msg(PostType::DeleteAll).unwrap();
+        } else if let Some(captures) = DELETE_RGX.captures(input) {
+            let msg_id = captures.get(1).unwrap().as_str().to_owned();
+            self.post_msg(PostType::Delete(msg_id)).unwrap();
         } else if input == "/cycles" {
             self.color_tx.send(()).unwrap();
         } else if input == "/cycle1" {
@@ -1055,6 +1061,13 @@ impl LeChatPHPClient {
             } => self.handle_normal_mode_key_event_k(app, 5),
             KeyEvent {
                 code: KeyCode::Enter,
+                modifiers,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.handle_normal_mode_key_event_member_pm(app)
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
                 ..
             } => self.handle_normal_mode_key_event_enter(app, messages),
@@ -1134,6 +1147,11 @@ impl LeChatPHPClient {
                 ..
             } => self.handle_normal_mode_key_event_toggle_v_view(),
             KeyEvent {
+                code: KeyCode::Char('C'),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => self.handle_normal_mode_key_event_shift_c(messages),
+            KeyEvent {
                 code: KeyCode::Char('H'),
                 modifiers: KeyModifiers::SHIFT,
                 ..
@@ -1164,7 +1182,7 @@ impl LeChatPHPClient {
                 ..
             } => self.handle_normal_mode_key_event_pm(app),
             KeyEvent {
-                code: KeyCode::Char('m'),
+                code: KeyCode::Char('a'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => self.handle_normal_mode_key_event_member_pm(app),
@@ -1190,6 +1208,11 @@ impl LeChatPHPClient {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => self.handle_normal_mode_key_event_warn(app),
+            KeyEvent {
+                code: KeyCode::Char('x'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.handle_normal_mode_key_event_delete(app, messages),
             KeyEvent {
                 code: KeyCode::Char('T'),
                 modifiers: KeyModifiers::SHIFT,
@@ -1618,6 +1641,31 @@ impl LeChatPHPClient {
         }
     }
 
+    fn handle_normal_mode_key_event_shift_c(
+        &mut self,
+        messages: &Arc<Mutex<Vec<Message>>>,
+    ) {
+        if self.clean_mode {
+            self.clean_mode = false;
+            return;
+        }
+        if let Some(session) = &self.session {
+            match fetch_clean_messages(
+                &self.client,
+                &self.config.url,
+                &self.config.page_php,
+                session,
+            ) {
+                Ok(msgs) => {
+                    let mut lock = messages.lock().unwrap();
+                    *lock = msgs;
+                    self.clean_mode = true;
+                }
+                Err(e) => log::error!("failed to load clean view: {}", e),
+            }
+        }
+    }
+
     fn handle_normal_mode_key_event_g(&mut self, app: &mut App) {
         // Handle "gg" key combination
         if self.last_key_event == Some(KeyCode::Char('g')) {
@@ -1809,6 +1857,29 @@ impl LeChatPHPClient {
                 app.input_idx = app.input.width();
                 app.input_mode = InputMode::Editing;
                 app.items.unselect();
+            }
+        }
+    }
+
+    fn handle_normal_mode_key_event_delete(
+        &mut self,
+        app: &mut App,
+        messages: &Arc<Mutex<Vec<Message>>>,
+    ) {
+        if let Some(idx) = app.items.state.selected() {
+            if let Some(id) = app.items.items.get(idx).and_then(|m| m.id) {
+                if self.clean_mode {
+                    self.post_msg(PostType::Delete(id.to_string())).unwrap();
+                    if let Ok(mut msgs) = messages.lock() {
+                        msgs.retain(|m| m.id != Some(id));
+                    }
+                    app.items.unselect();
+                } else {
+                    app.input = format!("/delete {}", id);
+                    app.input_idx = app.input.width();
+                    app.input_mode = InputMode::Editing;
+                    app.items.unselect();
+                }
             }
         }
     }
@@ -2726,6 +2797,35 @@ fn delete_message(
     Ok(())
 }
 
+fn fetch_clean_messages(
+    client: &Client,
+    base_url: &str,
+    page_php: &str,
+    session: &str,
+) -> anyhow::Result<Vec<Message>> {
+    let full_url = format!("{}/{}", base_url, page_php);
+    let url = format!("{}?action=post&session={}", full_url, session);
+    let resp_text = client.get(&url).send()?.text()?;
+    let doc = Document::from(resp_text.as_str());
+    let nc = doc
+        .find(Attr("name", "nc"))
+        .next()
+        .context("nc not found")?;
+    let nc_value = nc.attr("value").context("nc value not found")?.to_owned();
+    let params = vec![
+        ("lang", LANG.to_owned()),
+        ("nc", nc_value),
+        ("session", session.to_owned()),
+        ("action", "admin".to_owned()),
+        ("do", "clean".to_owned()),
+        ("what", "choose".to_owned()),
+    ];
+    let clean_resp_txt = client.post(&full_url).form(&params).send()?.text()?;
+    let doc = Document::from(clean_resp_txt.as_str());
+    let msgs = extract_messages(&doc)?;
+    Ok(msgs)
+}
+
 impl ChatClient {
     fn new(params: Params) -> Self {
         // println!("session[2026] : {:?}",params.session);
@@ -2788,6 +2888,7 @@ fn new_default_le_chat_php_client(params: Params) -> LeChatPHPClient {
         display_pm_only: false,
         display_staff_view: false,
         display_master_pm_view: false,
+        clean_mode: false,
     }
 }
 
@@ -3750,6 +3851,16 @@ fn render_help_txt(
         let style = Style::default().fg(fg);
         msg.extend(vec![Span::raw(" | "), Span::styled("H", style)]);
     }
+
+    if app.clean_mode {
+        let fg = tuiColor::LightGreen;
+        let style = Style::default().fg(fg).add_modifier(Modifier::BOLD);
+        msg.extend(vec![Span::raw(" | "), Span::styled("C", style)]);
+    } else {
+        let fg = tuiColor::Gray;
+        let style = Style::default().fg(fg);
+        msg.extend(vec![Span::raw(" | "), Span::styled("C", style)]);
+    }
     let mut text = Text::from(Spans::from(msg));
     text.patch_style(style);
     let help_message = Paragraph::new(text);
@@ -3804,9 +3915,12 @@ fn render_messages(
     let messages_list_items: Vec<ListItem> = messages
         .iter()
         .filter_map(|m| {
-            if !app.display_hidden_msgs && m.hide {
-                return None;
-            }
+            if app.clean_mode {
+                // In clean mode show all messages
+            } else {
+                if !app.display_hidden_msgs && m.hide {
+                    return None;
+                }
             // Simulate a guest view (remove "PMs" and "Members chat" messages)
             if app.display_guest_view {
                 // TODO: this is not efficient at all
@@ -3868,6 +3982,7 @@ fn render_messages(
                 {
                     return None;
                 }
+            }
             }
 
             app.items.items.push(m.clone());
@@ -3977,6 +4092,7 @@ struct App {
     display_pm_only: bool,
     display_staff_view: bool,
     display_master_pm_view: bool,
+    clean_mode: bool,
 }
 
 impl Default for App {
@@ -4031,6 +4147,7 @@ impl Default for App {
             display_pm_only: false,
             display_staff_view: false,
             display_master_pm_view: false,
+            clean_mode: false,
         }
     }
 }

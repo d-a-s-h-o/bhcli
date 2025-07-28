@@ -18,20 +18,20 @@ Pre-buit binaries can be found on the [official website](http://git.dkforestseea
 
 - Sound notifications when tagged/pmmed
 - Private messages `/pm username message`
-- Kick someone `/kick username message` | `/k username message`
+- Kick someone `/kick username message` | `/k username message` (Members +)
 - Delete last message `/dl`
 - Delete last X message `/dl5` will delete the last 5 messages
 - Delete all messages `/dall`
 - Ignore someone `/ignore username`
 - Unignore someone `/unignore username`
-- Ban a username and kick `/ban username`
-- Ban a username exactly `/ban "username"`
-- Filter messages containing text `/filter text`
-- List banned usernames `/banlist`
-- List exact banned usernames `/banexactlist`
-- List filtered message terms `/filterlist`
-- Unban a username `/unban username`
-- Remove a message filter `/unfilter text`
+- (Dasho) Ban a username and kick `/ban username` (Members +)
+- (Dasho) Ban a username exactly `/ban "username"` (Members +)
+- (Dasho) Filter messages containing text `/filter text` (Members +)
+- (Dasho) List banned usernames `/banlist` (Members +)
+- (Dasho) List exact banned usernames `/banexactlist` (Members +)
+- (Dasho) List filtered message terms `/filterlist` (Members +)
+- (Dasho) Unban a username `/unban username` (Members +)
+- (Dasho) Remove a message filter `/unfilter text` (Members +)
 - Toggle notifications sound `m`
 - Toggle a "guest" view, by filtering out PMs and "Members chat" `shift+G`
 - Toggle a "members" view, by filtering out PMs and "Guest chat" `shift+M`
@@ -40,9 +40,9 @@ Pre-buit binaries can be found on the [official website](http://git.dkforestseea
 - Copy the first link in a message to clipboard `shift+Y`
 - Directly tag author of selected message `t` will prefil the input with `@username `
 - Directly private message author of selected message `p` will prefil the input with `/pm username `
-- Shortcut to kick author of selected message `ctrl+k` will prefill with `/pm <master> #kick username` if a master account is set, otherwise `/kick username `
-- Shortcut to ban author of selected message `ctrl+b` will prefill with `/pm <master> #ban username` if a master account is set, otherwise `/ban username `
-- Use `ctrl+m` to prefill the input with `/pm <master> /m ` when a master account is set, or `/m ` when none is configured
+- (Dasho) Shortcut to kick author of selected message `ctrl+k` will prefill with `/pm <master> #kick username` if a master account is set, otherwise `/kick username `
+- (Dasho) Shortcut to ban author of selected message `ctrl+b` will prefill with `/pm <master> #ban username` if a master account is set, otherwise `/ban username ` (Again, only useful for members+ users)
+- (Dasho) Use `ctrl+a` to prefill the input with `/pm <master> /m ` when a master account is set, or `/m ` when none is configured (Again, only useful for members+ users)
 - captcha is displayed directly in terminal 10 times the real size
 - Upload file `/u C:\path\to\file.png @username message` (@username is optional) `@members` for members group
 - `<tab>` to autocomplete usernames while typing
@@ -118,8 +118,8 @@ To automatically login when starting the application, you can put the following 
 [profiles.default]
 username = "username"
 password = "password"
-alt_account = "myAlt"
-master_account = "myMain"
+alt_account = "myAlt" # Optional, only for members+ (Dasho)
+master_account = "myMain" # Optional, only for members+ (Dasho)
 ```
 ## Custom Commands
 
@@ -141,6 +141,7 @@ The configuration is stored using `confy`. On Linux this is usually
 `~/.config/bhcli/bhcli.toml`. You can edit this file to preload profiles,
 create custom commands and maintain filters.
 
+For members+ users, you can set the `alt_account` and `master_account` fields in the config file. (Dasho)
 To manually add or remove banned usernames or message filters you can edit the
 `bad_usernames`, `bad_exact_usernames` and `bad_messages` arrays in this file:
 
