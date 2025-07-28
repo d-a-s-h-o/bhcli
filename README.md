@@ -40,8 +40,9 @@ Pre-buit binaries can be found on the [official website](http://git.dkforestseea
 - Copy the first link in a message to clipboard `shift+Y`
 - Directly tag author of selected message `t` will prefil the input with `@username `
 - Directly private message author of selected message `p` will prefil the input with `/pm username `
-- Shortcut to kick author of selected message `ctrl+k` will prefil the input with `/kick username `
-- Shortcut to ban author of selected message `ctrl+b` will prefil the input with `/ban username `
+- Shortcut to kick author of selected message `ctrl+k` will prefill with `/pm <master> #kick username` if a master account is set, otherwise `/kick username `
+- Shortcut to ban author of selected message `ctrl+b` will prefill with `/pm <master> #ban username` if a master account is set, otherwise `/ban username `
+- Use `ctrl+m` to prefill the input with `/pm <master> /m ` when a master account is set, or `/m ` when none is configured
 - captcha is displayed directly in terminal 10 times the real size
 - Upload file `/u C:\path\to\file.png @username message` (@username is optional) `@members` for members group
 - `<tab>` to autocomplete usernames while typing
@@ -57,6 +58,7 @@ Pre-buit binaries can be found on the [official website](http://git.dkforestseea
 - `shift + T` for translating text to english. [ must have translate-shell installed on arch or debain ]
     > pacman -S translate-shell
 - Custom personal command creation for members+ [ read Command Creation ]
+- Set alternate and master accounts per profile using `/set alt <username>` and `/set master <username>`
 
 ### Editing mode
 - `ctrl+A` Move cursor to start of line
@@ -116,6 +118,8 @@ To automatically login when starting the application, you can put the following 
 [profiles.default]
 username = "username"
 password = "password"
+alt_account = "myAlt"
+master_account = "myMain"
 ```
 ## Custom Commands
 

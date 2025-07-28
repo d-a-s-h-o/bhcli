@@ -1,7 +1,7 @@
 mod bhc;
+mod harm;
 mod lechatphp;
 mod util;
-mod harm;
 
 use crate::lechatphp::LoginErr;
 use anyhow::{anyhow, Context};
@@ -19,6 +19,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use harm::{action_from_score, score_message, Action};
 use lazy_static::lazy_static;
 use linkify::LinkFinder;
 use log::LevelFilter;
@@ -35,9 +36,9 @@ use select::document::Document;
 use select::predicate::{Attr, Name};
 use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::Cursor;
 use std::io::{self, Write};
-use std::fs::OpenOptions;
 use std::process::Command;
 use std::sync::Mutex;
 use std::sync::{Arc, MutexGuard};
@@ -56,7 +57,6 @@ use tui::{
 };
 use unicode_width::UnicodeWidthStr;
 use util::StatefulList;
-use harm::{action_from_score, score_message, Action};
 
 const LANG: &str = "en";
 const SEND_TO_ALL: &str = "s *";
@@ -110,11 +110,19 @@ struct Profile {
     members_tag: String,
     #[serde(default = "default_empty_str")]
     keepalive_send_to: String,
+    #[serde(default)]
+    alt_account: Option<String>,
+    #[serde(default)]
+    master_account: Option<String>,
 }
 
 #[derive(Default, Debug, Serialize, Deserialize)]
 struct MyConfig {
     dkf_api_key: Option<String>,
+    #[serde(default)]
+    alt_account: Option<String>,
+    #[serde(default)]
+    master_account: Option<String>,
     #[serde(default)]
     bad_usernames: Vec<String>,
     #[serde(default)]
@@ -175,7 +183,7 @@ struct Opts {
     profile: String,
 
     //Strange
-    #[arg(long,default_value = "0")]
+    #[arg(long, default_value = "0")]
     keepalive_send_to: Option<String>,
 
     #[arg(long)]
@@ -248,6 +256,13 @@ struct LeChatPHPClient {
     bad_exact_username_filters: Arc<Mutex<Vec<String>>>,
     bad_message_filters: Arc<Mutex<Vec<String>>>,
     allowlist: Arc<Mutex<Vec<String>>>,
+
+    alt_account: Option<String>,
+    master_account: Option<String>,
+    profile: String,
+    display_pm_only: bool,
+    display_staff_view: bool,
+    display_master_pm_view: bool,
 }
 
 impl LeChatPHPClient {
@@ -323,9 +338,7 @@ impl LeChatPHPClient {
         let send_to = self.config.keepalive_send_to.clone();
         thread::spawn(move || loop {
             let clb = || {
-                tx.send(PostType::Post("keep alive".to_owned(), Some(send_to.clone())))
-                    .unwrap();
-                tx.send(PostType::DeleteLast).unwrap();
+                tx.send(PostType::KeepAlive(send_to.clone())).unwrap();
             };
             let timeout = after(Duration::from_secs(60 * 55));
             select! {
@@ -392,11 +405,14 @@ impl LeChatPHPClient {
         let exit_rx = sig.lock().unwrap().clone();
         let sig = Arc::clone(sig);
         let members_tag = self.config.members_tag.clone();
+        let staffs_tag = self.config.staffs_tag.clone();
         let tx = self.tx.clone();
         let bad_usernames = Arc::clone(&self.bad_username_filters);
         let bad_exact_usernames = Arc::clone(&self.bad_exact_username_filters);
         let bad_messages = Arc::clone(&self.bad_message_filters);
         let allowlist = Arc::clone(&self.allowlist);
+        let alt_account = self.alt_account.clone();
+        let master_account = self.master_account.clone();
         thread::spawn(move || loop {
             let (_stream, stream_handle) = OutputStream::try_default().unwrap();
             let source = Decoder::new_mp3(Cursor::new(SOUND1)).unwrap();
@@ -412,6 +428,7 @@ impl LeChatPHPClient {
                 &sig,
                 &messages_updated_tx,
                 &members_tag,
+                &staffs_tag,
                 &datetime_fmt,
                 &messages,
                 &mut should_notify,
@@ -420,6 +437,8 @@ impl LeChatPHPClient {
                 &bad_exact_usernames,
                 &bad_messages,
                 &allowlist,
+                alt_account.as_deref(),
+                master_account.as_deref(),
             ) {
                 log::error!("{}", err);
             };
@@ -480,6 +499,11 @@ impl LeChatPHPClient {
             app.display_guest_view = self.display_guest_view;
             app.display_member_view = self.display_member_view;
             app.display_hidden_msgs = self.display_hidden_msgs;
+            app.display_pm_only = self.display_pm_only;
+            app.display_staff_view = self.display_staff_view;
+            app.display_master_pm_view = self.display_master_pm_view;
+            app.alt_account = self.alt_account.clone();
+            app.master_account = self.master_account.clone();
             app.members_tag = self.config.members_tag.clone();
             app.staffs_tag = self.config.staffs_tag.clone();
 
@@ -532,7 +556,7 @@ impl LeChatPHPClient {
     fn login(&mut self) -> Result<(), LoginErr> {
         // If we provided a session, skip login process
         if self.session.is_some() {
-            // println!("Session in params: {:?}", self.session); 
+            // println!("Session in params: {:?}", self.session);
             return Ok(());
         }
         // println!("self.session is not Some");
@@ -606,6 +630,27 @@ impl LeChatPHPClient {
             cfg.allowlist = self.allowlist.lock().unwrap().clone();
             if let Err(e) = confy::store("bhcli", None, cfg) {
                 log::error!("failed to store config: {}", e);
+            }
+        }
+    }
+
+    fn set_account(&mut self, which: &str, username: String) {
+        if let Ok(mut cfg) = confy::load::<MyConfig>("bhcli", None) {
+            if let Some(profile_cfg) = cfg.profiles.get_mut(&self.profile) {
+                match which {
+                    "alt" => {
+                        profile_cfg.alt_account = Some(username.clone());
+                        self.alt_account = Some(username.clone());
+                    }
+                    "master" => {
+                        profile_cfg.master_account = Some(username.clone());
+                        self.master_account = Some(username.clone());
+                    }
+                    _ => return,
+                }
+                if let Err(e) = confy::store("bhcli", None, cfg) {
+                    log::error!("failed to store config: {}", e);
+                }
             }
         }
     }
@@ -720,7 +765,7 @@ impl LeChatPHPClient {
             };
             let exact = name.starts_with('"') && name.ends_with('"') && name.len() >= 2;
             if exact {
-                name = &name[1..name.len()-1];
+                name = &name[1..name.len() - 1];
             }
             let name = name.to_owned();
             if exact {
@@ -731,14 +776,16 @@ impl LeChatPHPClient {
                 f.push(name.clone());
             }
             self.save_filters();
-            self.post_msg(PostType::Kick(String::new(), name.clone())).unwrap();
+            self.post_msg(PostType::Kick(String::new(), name.clone()))
+                .unwrap();
             self.apply_ban_filters(users);
             let msg = if exact {
                 format!("Banned exact user \"{}\"", name)
             } else {
                 format!("Banned userfilter \"{}\"", name)
             };
-            self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
         } else if input.starts_with("/banmsg ") || input.starts_with("/filter ") {
             let term = if input.starts_with("/banmsg ") {
                 remove_prefix(input, "/banmsg ")
@@ -752,21 +799,24 @@ impl LeChatPHPClient {
             }
             self.save_filters();
             let msg = format!("Filtering messages including \"{}\"", term);
-            self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
         } else if input == "/banlist" {
             let list = self.list_filters(true);
             let list_exact = self.list_exact_filters();
-            let msg = format!("Banned names: {}", list) +
-                &if list_exact.is_empty() {
+            let msg = format!("Banned names: {}", list)
+                + &if list_exact.is_empty() {
                     String::new()
                 } else {
                     format!("\nBanned exact names: {}", list_exact)
                 };
-            self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
         } else if input == "/filterlist" {
             let list = self.list_filters(false);
             let msg = format!("Filtered messages: {}", list);
-            self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
         } else if input.starts_with("/unban ") {
             let mut name = remove_prefix(input, "/unban ");
             if name.starts_with('"') && name.ends_with('"') && name.len() >= 2 {
@@ -775,14 +825,33 @@ impl LeChatPHPClient {
             if self.remove_filter(name, true) {
                 self.save_filters();
                 let msg = format!("Unbanned {}", name);
-                self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+                self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                    .unwrap();
             }
         } else if input.starts_with("/unfilter ") {
             let term = remove_prefix(input, "/unfilter ");
             if self.remove_filter(term, false) {
                 self.save_filters();
                 let msg = format!("Unfiltered \"{}\"", term);
-                self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+                self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                    .unwrap();
+            }
+        } else if input.starts_with("/set ") {
+            let rest = remove_prefix(input, "/set ");
+            if let Some(username) = rest.strip_prefix("alt ") {
+                let user = username.to_owned();
+                self.set_account("alt", user.clone());
+                let msg = format!("ALT account set to {}", user);
+                self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                    .unwrap();
+            } else if let Some(username) = rest.strip_prefix("master ") {
+                let user = username.to_owned();
+                self.set_account("master", user.clone());
+                let msg = format!("MASTER account set to {}", user);
+                self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                    .unwrap();
+            } else {
+                return false;
             }
         } else if input.starts_with("/allow ") {
             let user = remove_prefix(input, "/allow ").to_owned();
@@ -794,7 +863,8 @@ impl LeChatPHPClient {
             }
             self.save_filters();
             let msg = format!("Allowed {}", user);
-            self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
         } else if input.starts_with("/revoke ") {
             let user = remove_prefix(input, "/revoke ").to_owned();
             {
@@ -805,12 +875,18 @@ impl LeChatPHPClient {
             }
             self.save_filters();
             let msg = format!("Revoked {}", user);
-            self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
         } else if input == "/allowlist" {
             let list = self.allowlist.lock().unwrap().clone();
-            let out = if list.is_empty() { String::from("(empty)") } else { list.join(", ") };
+            let out = if list.is_empty() {
+                String::from("(empty)")
+            } else {
+                list.join(", ")
+            };
             let msg = format!("Allowlist: {}", out);
-            self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
         } else if let Some(captures) = IGNORE_RGX.captures(input) {
             let username = captures[1].to_owned();
             self.post_msg(PostType::Ignore(username)).unwrap();
@@ -833,7 +909,8 @@ impl LeChatPHPClient {
                 Some(msg_match) => msg_match.as_str().to_owned(),
                 None => "".to_owned(),
             };
-            self.post_msg(PostType::Upload(file_path, send_to, msg)).unwrap();
+            self.post_msg(PostType::Upload(file_path, send_to, msg))
+                .unwrap();
         } else if input.starts_with("!warn") {
             let msg = input.trim_start_matches("!warn").trim();
             let msg = if msg.starts_with('@') {
@@ -847,9 +924,7 @@ impl LeChatPHPClient {
                 "This is your warning - {}, will be kicked next. Please read the !-rules / https://4-0-4.io/bhc-rules",
                 msg
             );
-            self
-                .post_msg(PostType::Post(end_msg, None))
-                .unwrap();
+            self.post_msg(PostType::Post(end_msg, None)).unwrap();
         } else {
             return false;
         }
@@ -962,7 +1037,7 @@ impl LeChatPHPClient {
                 code: KeyCode::Char('J'),
                 modifiers: KeyModifiers::SHIFT,
                 ..
-            } => self.handle_normal_mode_key_event_j(app,5),
+            } => self.handle_normal_mode_key_event_j(app, 5),
             KeyEvent {
                 code: KeyCode::Char('k'),
                 modifiers: KeyModifiers::NONE,
@@ -977,7 +1052,7 @@ impl LeChatPHPClient {
                 code: KeyCode::Char('K'),
                 modifiers: KeyModifiers::SHIFT,
                 ..
-            } => self.handle_normal_mode_key_event_k(app,5),
+            } => self.handle_normal_mode_key_event_k(app, 5),
             KeyEvent {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
@@ -1049,6 +1124,16 @@ impl LeChatPHPClient {
                 ..
             } => self.handle_normal_mode_key_event_toggle_guest_view(),
             KeyEvent {
+                code: KeyCode::Char('P'),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => self.handle_normal_mode_key_event_toggle_pm_only(),
+            KeyEvent {
+                code: KeyCode::Char('V'),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => self.handle_normal_mode_key_event_toggle_v_view(),
+            KeyEvent {
                 code: KeyCode::Char('H'),
                 modifiers: KeyModifiers::SHIFT,
                 ..
@@ -1078,6 +1163,11 @@ impl LeChatPHPClient {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => self.handle_normal_mode_key_event_pm(app),
+            KeyEvent {
+                code: KeyCode::Char('m'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.handle_normal_mode_key_event_member_pm(app),
             KeyEvent {
                 code: KeyCode::Char('k'),
                 modifiers: KeyModifiers::CONTROL,
@@ -1160,7 +1250,9 @@ impl LeChatPHPClient {
                 ..
             } if modifiers.contains(KeyModifiers::SHIFT)
                 || modifiers.contains(KeyModifiers::CONTROL) =>
-                self.handle_editing_mode_key_event_newline(app),
+            {
+                self.handle_editing_mode_key_event_newline(app)
+            }
             KeyEvent {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
@@ -1354,12 +1446,19 @@ impl LeChatPHPClient {
                 if let Some(upload_link) = &item.upload_link {
                     let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
                     let mut out = format!("{}{}", self.config.url, upload_link);
-                    if let Some((_, _, msg)) = get_message(&item.text, &self.config.members_tag) {
+                    if let Some((_, _, msg)) = get_message(
+                        &item.text,
+                        &self.config.members_tag,
+                        &self.config.staffs_tag,
+                    ) {
                         out = format!("{} {}", msg, out);
                     }
                     ctx.set_contents(out).unwrap();
-                } else if let Some((_, _, msg)) = get_message(&item.text, &self.config.members_tag)
-                {
+                } else if let Some((_, _, msg)) = get_message(
+                    &item.text,
+                    &self.config.members_tag,
+                    &self.config.staffs_tag,
+                ) {
                     let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
                     ctx.set_contents(msg).unwrap();
                 }
@@ -1374,8 +1473,11 @@ impl LeChatPHPClient {
                     let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
                     let out = format!("{}{}", self.config.url, upload_link);
                     ctx.set_contents(out).unwrap();
-                } else if let Some((_, _, msg)) = get_message(&item.text, &self.config.members_tag)
-                {
+                } else if let Some((_, _, msg)) = get_message(
+                    &item.text,
+                    &self.config.members_tag,
+                    &self.config.staffs_tag,
+                ) {
                     let finder = LinkFinder::new();
                     let links: Vec<_> = finder.links(msg.as_str()).collect();
                     if let Some(link) = links.get(0) {
@@ -1405,8 +1507,11 @@ impl LeChatPHPClient {
                         .arg("download.img")
                         .output()
                         .expect("Failed to execute curl command");
-                } else if let Some((_, _, msg)) = get_message(&item.text, &self.config.members_tag)
-                {
+                } else if let Some((_, _, msg)) = get_message(
+                    &item.text,
+                    &self.config.members_tag,
+                    &self.config.staffs_tag,
+                ) {
                     let finder = LinkFinder::new();
                     let links: Vec<_> = finder.links(msg.as_str()).collect();
                     if let Some(link) = links.first() {
@@ -1452,8 +1557,11 @@ impl LeChatPHPClient {
                         .arg("./download.img")
                         .output()
                         .expect("Failed to execute sxiv command");
-                } else if let Some((_, _, msg)) = get_message(&item.text, &self.config.members_tag)
-                {
+                } else if let Some((_, _, msg)) = get_message(
+                    &item.text,
+                    &self.config.members_tag,
+                    &self.config.staffs_tag,
+                ) {
                     let finder = LinkFinder::new();
                     let links: Vec<_> = finder.links(msg.as_str()).collect();
                     if let Some(link) = links.first() {
@@ -1498,6 +1606,18 @@ impl LeChatPHPClient {
         self.display_member_view = !self.display_member_view;
     }
 
+    fn handle_normal_mode_key_event_toggle_pm_only(&mut self) {
+        self.display_pm_only = !self.display_pm_only;
+    }
+
+    fn handle_normal_mode_key_event_toggle_v_view(&mut self) {
+        if self.master_account.is_some() {
+            self.display_master_pm_view = !self.display_master_pm_view;
+        } else {
+            self.display_staff_view = !self.display_staff_view;
+        }
+    }
+
     fn handle_normal_mode_key_event_g(&mut self, app: &mut App) {
         // Handle "gg" key combination
         if self.last_key_event == Some(KeyCode::Char('g')) {
@@ -1527,10 +1647,28 @@ impl LeChatPHPClient {
     fn handle_normal_mode_key_event_tag(&mut self, app: &mut App) {
         if let Some(idx) = app.items.state.selected() {
             let text = &app.items.items.get(idx).unwrap().text;
-            if let Some(username) =
-                get_username(&self.base_client.username, &text, &self.config.members_tag)
-            {
-                if text.text().starts_with(&app.members_tag) {
+            if let Some(username) = get_username(
+                &self.base_client.username,
+                &text,
+                &self.config.members_tag,
+                &self.config.staffs_tag,
+            ) {
+                let txt = text.text();
+                if let Some(master) = &self.master_account {
+                    if let Some((cmd, original)) =
+                        parse_forwarded_username(&txt, &app.members_tag, &app.staffs_tag)
+                    {
+                        app.input = format!("/pm {} {} @{} ", master, cmd, original);
+                        app.input_idx = app.input.width();
+                        app.input_mode = InputMode::Editing;
+                        app.items.unselect();
+                        return;
+                    }
+                }
+
+                if txt.starts_with(&app.staffs_tag) {
+                    app.input = format!("/s @{} ", username);
+                } else if txt.starts_with(&app.members_tag) {
                     app.input = format!("/m @{} ", username);
                 } else {
                     app.input = format!("@{} ", username);
@@ -1548,6 +1686,7 @@ impl LeChatPHPClient {
                 &self.base_client.username,
                 &app.items.items.get(idx).unwrap().text,
                 &self.config.members_tag,
+                &self.config.staffs_tag,
             ) {
                 app.input = format!("/pm {} ", username);
                 app.input_idx = app.input.width();
@@ -1557,14 +1696,30 @@ impl LeChatPHPClient {
         }
     }
 
+    fn handle_normal_mode_key_event_member_pm(&mut self, app: &mut App) {
+        if let Some(master) = &self.master_account {
+            app.input = format!("/pm {} /m ", master);
+        } else {
+            app.input = "/m ".to_owned();
+        }
+        app.input_idx = app.input.width();
+        app.input_mode = InputMode::Editing;
+        app.items.unselect();
+    }
+
     fn handle_normal_mode_key_event_kick(&mut self, app: &mut App) {
         if let Some(idx) = app.items.state.selected() {
             if let Some(username) = get_username(
                 &self.base_client.username,
                 &app.items.items.get(idx).unwrap().text,
                 &self.config.members_tag,
+                &self.config.staffs_tag,
             ) {
-                app.input = format!("/kick {} ", username);
+                if let Some(master) = &self.master_account {
+                    app.input = format!("/pm {} #kick {} ", master, username);
+                } else {
+                    app.input = format!("/kick {} ", username);
+                }
                 app.input_idx = app.input.width();
                 app.input_mode = InputMode::Editing;
                 app.items.unselect();
@@ -1578,8 +1733,13 @@ impl LeChatPHPClient {
                 &self.base_client.username,
                 &app.items.items.get(idx).unwrap().text,
                 &self.config.members_tag,
+                &self.config.staffs_tag,
             ) {
-                app.input = format!("/ban {} ", username);
+                if let Some(master) = &self.master_account {
+                    app.input = format!("/pm {} #ban {} ", master, username);
+                } else {
+                    app.input = format!("/ban {} ", username);
+                }
                 app.input_idx = app.input.width();
                 app.input_mode = InputMode::Editing;
                 app.items.unselect();
@@ -1593,6 +1753,7 @@ impl LeChatPHPClient {
                 &self.base_client.username,
                 &app.items.items.get(idx).unwrap().text,
                 &self.config.members_tag,
+                &self.config.staffs_tag,
             ) {
                 app.input = format!(r#"/ban "{}" "#, username);
                 app.input_idx = app.input.width();
@@ -1642,6 +1803,7 @@ impl LeChatPHPClient {
                 &self.base_client.username,
                 &app.items.items.get(idx).unwrap().text,
                 &self.config.members_tag,
+                &self.config.staffs_tag,
             ) {
                 app.input = format!("!warn @{} ", username);
                 app.input_idx = app.input.width();
@@ -2001,6 +2163,7 @@ fn post_msg(
     last_post_tx: &crossbeam_channel::Sender<()>,
 ) {
     let mut should_reset_keepalive_timer = false;
+    let mut delete_after = false;
     retry_fn(|| -> anyhow::Result<RetryErr> {
         let post_type = post_type_recv.clone();
         let resp_text = client.get(url).send()?.text()?;
@@ -2044,6 +2207,17 @@ fn post_msg(
                     ("multi", "on".to_owned()),
                     ("message", msg),
                     ("sendto", send_to.unwrap_or(SEND_TO_ALL.to_owned())),
+                ]);
+            }
+            PostType::KeepAlive(send_to) => {
+                should_reset_keepalive_timer = true;
+                delete_after = true;
+                params.extend(vec![
+                    ("action", "post".to_owned()),
+                    ("postid", postid_value.to_owned()),
+                    ("multi", "on".to_owned()),
+                    ("message", "keep alive".to_owned()),
+                    ("sendto", send_to),
                 ]);
             }
             PostType::NewNickname(new_nickname) => {
@@ -2109,6 +2283,15 @@ fn post_msg(
                     params.extend(vec![("sendto", "".to_owned()), ("what", "last".to_owned())]);
                 }
             }
+            PostType::Delete(msg) => {
+                params.extend(vec![
+                    ("action", "admin".to_owned()),
+                    ("do", "clean".to_owned()),
+                    ("what", "selected".to_owned()),
+                    ("mid[]", msg.to_owned()),
+                    ("sendto", SEND_TO_ALL.to_owned()),
+                ]);
+            }
             PostType::Upload(file_path, send_to, msg) => {
                 form = Some(
                     match multipart::Form::new()
@@ -2138,10 +2321,36 @@ fn post_msg(
         } else {
             req = req.form(&params);
         }
-        if let Err(err) = req.send() {
-            log::error!("{:?}", err.to_string());
-            if err.is_timeout() {
+        match req.send() {
+            Ok(resp) => {
+                if let Err(err) = resp.error_for_status_ref() {
+                    log::error!("HTTP error: {:?}", err);
+                    return Ok(RetryErr::Retry);
+                }
+            }
+            Err(err) => {
+                log::error!("{:?}", err.to_string());
+                if err.is_timeout() {
+                    return Ok(RetryErr::Retry);
+                }
                 return Ok(RetryErr::Retry);
+            }
+        }
+
+        if delete_after {
+            let params = vec![
+                ("lang", LANG.to_owned()),
+                ("nc", nc_value.to_owned()),
+                ("session", session.clone()),
+                ("action", "delete".to_owned()),
+                ("sendto", "".to_owned()),
+                ("what", "last".to_owned()),
+            ];
+            if let Err(err) = client.post(full_url).form(&params).send() {
+                log::error!("{:?}", err.to_string());
+                if err.is_timeout() {
+                    return Ok(RetryErr::Retry);
+                }
             }
         }
         return Ok(RetryErr::Exit);
@@ -2171,6 +2380,7 @@ fn get_msgs(
     sig: &Arc<Mutex<Sig>>,
     messages_updated_tx: &crossbeam_channel::Sender<()>,
     members_tag: &str,
+    staffs_tag: &str,
     datetime_fmt: &str,
     messages: &Arc<Mutex<Vec<Message>>>,
     should_notify: &mut bool,
@@ -2179,6 +2389,8 @@ fn get_msgs(
     bad_exact_usernames: &Arc<Mutex<Vec<String>>>,
     bad_messages: &Arc<Mutex<Vec<String>>>,
     allowlist: &Arc<Mutex<Vec<String>>>,
+    alt_account: Option<&str>,
+    master_account: Option<&str>,
 ) -> anyhow::Result<()> {
     let url = format!(
         "{}/{}?action=view&session={}&lang={}",
@@ -2203,7 +2415,9 @@ fn get_msgs(
         for (_, name) in &current_users.guests {
             if !previous.guests.iter().any(|(_, n)| n == name) {
                 if exact_filters.iter().any(|f| f == name)
-                    || filters.iter().any(|f| name.to_lowercase().contains(&f.to_lowercase()))
+                    || filters
+                        .iter()
+                        .any(|f| name.to_lowercase().contains(&f.to_lowercase()))
                 {
                     let _ = tx.send(PostType::Kick(String::new(), name.clone()));
                 }
@@ -2217,6 +2431,7 @@ fn get_msgs(
             &messages,
             datetime_fmt,
             members_tag,
+            staffs_tag,
             username,
             should_notify,
             &current_users,
@@ -2225,9 +2440,18 @@ fn get_msgs(
             bad_exact_usernames,
             bad_messages,
             allowlist,
+            alt_account,
         );
         // Build messages vector. Tag deleted messages.
-        update_messages(new_messages, messages, datetime_fmt);
+        update_messages(
+            new_messages,
+            messages,
+            datetime_fmt,
+            members_tag,
+            staffs_tag,
+            alt_account,
+            master_account,
+        );
         // Notify new messages has arrived.
         // This ensure that we redraw the messages on the screen right away.
         // Otherwise, the screen would not redraw until a keyboard event occurs.
@@ -2245,6 +2469,7 @@ fn process_new_messages(
     messages: &MutexGuard<Vec<Message>>,
     datetime_fmt: &str,
     members_tag: &str,
+    staffs_tag: &str,
     username: &str,
     should_notify: &mut bool,
     users: &Users,
@@ -2253,6 +2478,7 @@ fn process_new_messages(
     bad_exact_usernames: &Arc<Mutex<Vec<String>>>,
     bad_messages: &Arc<Mutex<Vec<String>>>,
     allowlist: &Arc<Mutex<Vec<String>>>,
+    alt_account: Option<&str>,
 ) {
     if let Some(last_known_msg) = messages.first() {
         let last_known_msg_parsed_dt = parse_date(&last_known_msg.date, datetime_fmt);
@@ -2261,8 +2487,8 @@ fn process_new_messages(
                 && !(new_msg.date == last_known_msg.date && last_known_msg.text == new_msg.text)
         });
         for new_msg in filtered {
-            log_chat_message(new_msg);
-            if let Some((from, to_opt, msg)) = get_message(&new_msg.text, members_tag) {
+            log_chat_message(new_msg, username);
+            if let Some((from, to_opt, msg)) = get_message(&new_msg.text, members_tag, staffs_tag) {
                 // Notify when tagged
                 if msg.contains(format!("@{}", &username).as_str()) {
                     *should_notify = true;
@@ -2305,11 +2531,40 @@ fn process_new_messages(
                     }
                 }
 
+                if let Some(alt) = alt_account {
+                    let text = new_msg.text.text();
+                    if (text.starts_with(members_tag) || text.starts_with(staffs_tag))
+                        && from != alt
+                    {
+                        let _ = tx.send(PostType::Post(text.clone(), Some(alt.to_owned())));
+                    }
+                    if from == alt && to_opt.as_deref() == Some(username) {
+                        if let Some(stripped) = msg.strip_prefix("/m ") {
+                            let _ = tx.send(PostType::Post(
+                                stripped.to_owned(),
+                                Some(SEND_TO_MEMBERS.to_owned()),
+                            ));
+                            // Echo the message back to the alt so it can confirm
+                            let confirm = format!("{}{} - {}", members_tag, username, stripped);
+                            let _ = tx.send(PostType::Post(confirm, Some(alt.to_owned())));
+                        } else if let Some(stripped) = msg.strip_prefix("/s ") {
+                            let _ = tx.send(PostType::Post(
+                                stripped.to_owned(),
+                                Some(SEND_TO_STAFFS.to_owned()),
+                            ));
+                            let confirm = format!("{}{} - {}", staffs_tag, username, stripped);
+                            let _ = tx.send(PostType::Post(confirm, Some(alt.to_owned())));
+                        }
+                    }
+                }
+
                 let is_guest = users.guests.iter().any(|(_, n)| n == &from);
                 if from != username && is_guest {
                     let bad_name = {
                         let filters = bad_usernames.lock().unwrap();
-                        filters.iter().any(|f| from.to_lowercase().contains(&f.to_lowercase()))
+                        filters
+                            .iter()
+                            .any(|f| from.to_lowercase().contains(&f.to_lowercase()))
                     };
                     let bad_name_exact = {
                         let filters = bad_exact_usernames.lock().unwrap();
@@ -2317,7 +2572,9 @@ fn process_new_messages(
                     };
                     let bad_msg = {
                         let filters = bad_messages.lock().unwrap();
-                        filters.iter().any(|f| msg.to_lowercase().contains(&f.to_lowercase()))
+                        filters
+                            .iter()
+                            .any(|f| msg.to_lowercase().contains(&f.to_lowercase()))
                     };
 
                     if bad_name_exact || bad_name || bad_msg {
@@ -2359,9 +2616,25 @@ fn update_messages(
     new_messages: Vec<Message>,
     mut messages: MutexGuard<Vec<Message>>,
     datetime_fmt: &str,
+    members_tag: &str,
+    staffs_tag: &str,
+    alt_account: Option<&str>,
+    master_account: Option<&str>,
 ) {
     let mut old_msg_ptr = 0;
-    for new_msg in new_messages.into_iter() {
+    for mut new_msg in new_messages.into_iter() {
+        if let Some((from, Some(to), _)) = get_message(&new_msg.text, members_tag, staffs_tag) {
+            if let Some(master) = master_account {
+                if to == master && from != master {
+                    new_msg.hide = true;
+                }
+            }
+            if let Some(alt) = alt_account {
+                if to == alt && from != alt {
+                    new_msg.hide = true;
+                }
+            }
+        }
         loop {
             if let Some(old_msg) = messages.get_mut(old_msg_ptr) {
                 let new_parsed_dt = parse_date(&new_msg.date, datetime_fmt);
@@ -2406,10 +2679,11 @@ fn update_messages(
     messages.truncate(1000);
 }
 
-fn log_chat_message(msg: &Message) {
+fn log_chat_message(msg: &Message, username: &str) {
     if let Ok(path) = confy::get_configuration_file_path("bhcli", None) {
         if let Some(dir) = path.parent() {
-            let log_path = dir.join("chat-log.txt");
+            let log_filename = format!("{}-log.txt", username);
+            let log_path = dir.join(log_filename);
             if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log_path) {
                 let _ = writeln!(f, "{} - {}", msg.date, msg.text.text());
             }
@@ -2508,6 +2782,12 @@ fn new_default_le_chat_php_client(params: Params) -> LeChatPHPClient {
         bad_exact_username_filters: Arc::new(Mutex::new(params.bad_exact_usernames)),
         bad_message_filters: Arc::new(Mutex::new(params.bad_messages)),
         allowlist: Arc::new(Mutex::new(params.allowlist)),
+        alt_account: params.alt_account,
+        master_account: params.master_account,
+        profile: params.profile,
+        display_pm_only: false,
+        display_staff_view: false,
+        display_master_pm_view: false,
     }
 }
 
@@ -2535,6 +2815,9 @@ struct Params {
     bad_exact_usernames: Vec<String>,
     bad_messages: Vec<String>,
     allowlist: Vec<String>,
+    alt_account: Option<String>,
+    master_account: Option<String>,
+    profile: String,
 }
 
 #[derive(Clone)]
@@ -2618,7 +2901,7 @@ fn get_guest_color(wanted: Option<String>) -> String {
 }
 
 fn get_tor_client(socks_proxy_url: &str, no_proxy: bool) -> Client {
-    let ua = "Mozilla/5.0 (Windows NT 10.0; rv:102.0) Gecko/20100101 Firefox/102.0";
+    let ua = "Dasho's Black Hat Chat Client v0.1-Epic";
     let mut builder = reqwest::blocking::ClientBuilder::new()
         .redirect(Policy::none())
         .cookie_store(true)
@@ -2761,11 +3044,12 @@ fn main() -> anyhow::Result<()> {
     let mut opts: Opts = Opts::parse();
     // println!("Parsed Session: {:?}", opts.session);
 
-
     // Configs file
     if let Ok(config_path) = confy::get_configuration_file_path("bhcli", None) {
         println!("Config path: {:?}", config_path);
     }
+    let mut alt_account = None;
+    let mut master_account = None;
     if let Ok(cfg) = confy::load::<MyConfig>("bhcli", None) {
         if opts.dkf_api_key.is_none() {
             opts.dkf_api_key = cfg.dkf_api_key;
@@ -2784,6 +3068,13 @@ fn main() -> anyhow::Result<()> {
         opts.bad_exact_usernames = Some(bad_exact_usernames);
         opts.bad_messages = Some(bad_messages);
         opts.allowlist = Some(allowlist_cfg);
+        if let Some(profile_cfg) = cfg.profiles.get(&opts.profile) {
+            alt_account = profile_cfg.alt_account.clone().or(cfg.alt_account);
+            master_account = profile_cfg.master_account.clone().or(cfg.master_account);
+        } else {
+            alt_account = cfg.alt_account;
+            master_account = cfg.master_account;
+        }
     }
 
     let logfile = FileAppender::builder()
@@ -2834,9 +3125,11 @@ fn main() -> anyhow::Result<()> {
         bad_exact_usernames: opts.bad_exact_usernames.unwrap_or_default(),
         bad_messages: opts.bad_messages.unwrap_or_default(),
         allowlist: opts.allowlist.unwrap_or_default(),
+        alt_account,
+        master_account,
+        profile: opts.profile.clone(),
     };
     // println!("Session[2378]: {:?}", opts.session);
-
 
     ChatClient::new(params).run_forever();
 
@@ -2849,7 +3142,9 @@ enum PostType {
     Kick(String, String),           // Message, Username
     Upload(String, String, String), // FilePath, SendTo, Message
     DeleteLast,                     // DeleteLast
+    Delete(String),                 // Delete message
     DeleteAll,                      // DeleteAll
+    KeepAlive(String),              // SendTo for keepalive
     NewNickname(String),            // NewUsername
     NewColor(String),               // NewColor
     Profile(String, String),        // NewColor, NewUsername
@@ -2859,8 +3154,13 @@ enum PostType {
 }
 
 // Get username of other user (or ours if it's the only one)
-fn get_username(own_username: &str, root: &StyledText, members_tag: &str) -> Option<String> {
-    match get_message(root, members_tag) {
+fn get_username(
+    own_username: &str,
+    root: &StyledText,
+    members_tag: &str,
+    staffs_tag: &str,
+) -> Option<String> {
+    match get_message(root, members_tag, staffs_tag) {
         Some((from, Some(to), _)) => {
             if from == own_username {
                 return Some(to);
@@ -2875,7 +3175,11 @@ fn get_username(own_username: &str, root: &StyledText, members_tag: &str) -> Opt
 }
 
 // Extract "from"/"to"/"message content" from a "StyledText"
-fn get_message(root: &StyledText, members_tag: &str) -> Option<(String, Option<String>, String)> {
+fn get_message(
+    root: &StyledText,
+    members_tag: &str,
+    staffs_tag: &str,
+) -> Option<(String, Option<String>, String)> {
     if let StyledText::Styled(_, children) = root {
         let msg = children.get(0)?.text();
         match children.get(children.len() - 1)? {
@@ -2887,7 +3191,7 @@ fn get_message(root: &StyledText, members_tag: &str) -> Option<(String, Option<S
                 return Some((from, None, msg));
             }
             StyledText::Text(t) => {
-                if t == &members_tag {
+                if t == &members_tag || t == &staffs_tag {
                     let from = match children.get(children.len() - 2)? {
                         StyledText::Styled(_, children) => {
                             match children.get(children.len() - 1)? {
@@ -3162,6 +3466,46 @@ fn remove_prefix<'a>(s: &'a str, prefix: &str) -> &'a str {
     s.strip_prefix(prefix).unwrap_or(s)
 }
 
+fn parse_forwarded_username(
+    text: &str,
+    members_tag: &str,
+    staffs_tag: &str,
+) -> Option<(&'static str, String)> {
+    lazy_static! {
+        static ref FORWARD_RGX: Regex = Regex::new(r"^\[[^\]]+ to [^\]]+\]\s*").unwrap();
+    }
+
+    if let Some(mat) = FORWARD_RGX.find(text) {
+        let mut rest = text[mat.end()..].trim_start();
+        // Some forwarded messages contain a leading dash or colon after the
+        // forwarding header. Trim those so we can properly match the tags.
+        rest = rest
+            .trim_start_matches(|c: char| c == '-' || c == ':')
+            .trim_start();
+
+        if let Some(rem) = rest.strip_prefix(members_tag) {
+            let name = rem
+                .trim_start()
+                .split(|c: char| c == ' ' || c == ':' || c == '-')
+                .next()
+                .unwrap_or("")
+                .trim_matches('@')
+                .to_owned();
+            return Some(("/m", name));
+        } else if let Some(rem) = rest.strip_prefix(staffs_tag) {
+            let name = rem
+                .trim_start()
+                .split(|c: char| c == ' ' || c == ':' || c == '-')
+                .next()
+                .unwrap_or("")
+                .trim_matches('@')
+                .to_owned();
+            return Some(("/s", name));
+        }
+    }
+    None
+}
+
 fn extract_messages(doc: &Document) -> anyhow::Result<Vec<Message>> {
     let msgs = doc
         .find(Attr("id", "messages"))
@@ -3266,11 +3610,12 @@ fn gen_lines(msg_txt: &StyledText, w: usize, line_prefix: &str) -> Vec<Vec<(tuiC
                     if let Some(valid_slice) = txt.get(0..remain) {
                         line.push((color, valid_slice.to_owned()));
                     } else {
-                        let valid_remain = txt.char_indices()
+                        let valid_remain = txt
+                            .char_indices()
                             .take_while(|&(i, _)| i < remain)
                             .last()
                             .map(|(i, _)| i)
-                            .unwrap_or(txt.len());  
+                            .unwrap_or(txt.len());
 
                         line.push((color, txt[..valid_remain].to_owned()));
                     }
@@ -3282,7 +3627,8 @@ fn gen_lines(msg_txt: &StyledText, w: usize, line_prefix: &str) -> Vec<Vec<(tuiC
                     if let Some(valid_slice) = txt.get(remain..) {
                         ctxt.push((color, valid_slice.to_owned()));
                     } else {
-                        let valid_remain = txt.char_indices()
+                        let valid_remain = txt
+                            .char_indices()
                             .skip_while(|&(i, _)| i < remain) // Find first valid boundary after remain
                             .map(|(i, _)| i)
                             .next()
@@ -3468,7 +3814,9 @@ fn render_messages(
                 if text.starts_with(&app.members_tag) || text.starts_with(&app.staffs_tag) {
                     return None;
                 }
-                if let Some((_, Some(_), _)) = get_message(&m.text, &app.members_tag) {
+                if let Some((_, Some(_), _)) =
+                    get_message(&m.text, &app.members_tag, &app.staffs_tag)
+                {
                     return None;
                 }
             }
@@ -3481,8 +3829,33 @@ fn render_messages(
                 if !text.starts_with(&app.members_tag) && !text.starts_with(&app.staffs_tag) {
                     return None;
                 }
-                if let Some((_, Some(_), _)) = get_message(&m.text, &app.members_tag) {
+                if let Some((_, Some(_), _)) =
+                    get_message(&m.text, &app.members_tag, &app.staffs_tag)
+                {
                     return None;
+                }
+            }
+
+            if app.display_pm_only {
+                match get_message(&m.text, &app.members_tag, &app.staffs_tag) {
+                    Some((_, Some(_), _)) => {}
+                    _ => return None,
+                }
+            }
+
+            if app.display_staff_view {
+                let text = m.text.text();
+                if !text.starts_with(&app.staffs_tag) {
+                    return None;
+                }
+            }
+
+            if app.display_master_pm_view {
+                if let Some(master) = &app.master_account {
+                    match get_message(&m.text, &app.members_tag, &app.staffs_tag) {
+                        Some((from, Some(_), _)) if from == *master => {}
+                        _ => return None,
+                    }
                 }
             }
 
@@ -3598,6 +3971,12 @@ struct App {
     staffs_tag: String,
     long_message: Option<Message>,
     commands: Commands,
+
+    alt_account: Option<String>,
+    master_account: Option<String>,
+    display_pm_only: bool,
+    display_staff_view: bool,
+    display_master_pm_view: bool,
 }
 
 impl Default for App {
@@ -3647,6 +4026,11 @@ impl Default for App {
             staffs_tag: "".to_owned(),
             long_message: None,
             commands,
+            alt_account: None,
+            master_account: None,
+            display_pm_only: false,
+            display_staff_view: false,
+            display_master_pm_view: false,
         }
     }
 }
@@ -3804,5 +4188,32 @@ mod tests {
         );
         let lines = gen_lines(&txt, 71, "");
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn parse_forwarded_username_member() {
+        let text = "[Alice to Bob] [M] @foo: hi";
+        assert_eq!(
+            parse_forwarded_username(text, "[M] ", "[Staff] "),
+            Some(("/m", "foo".to_owned()))
+        );
+    }
+
+    #[test]
+    fn parse_forwarded_username_staff() {
+        let text = "[Jack to Squareeyes] [Staff] @bar: hey";
+        assert_eq!(
+            parse_forwarded_username(text, "[M] ", "[Staff] "),
+            Some(("/s", "bar".to_owned()))
+        );
+    }
+
+    #[test]
+    fn parse_forwarded_username_with_dash() {
+        let text = "[Dasho to Dexter] - [M] rex - @sh4d0w most welcome";
+        assert_eq!(
+            parse_forwarded_username(text, "[M] ", "[Staff] "),
+            Some(("/m", "rex".to_owned()))
+        );
     }
 }
