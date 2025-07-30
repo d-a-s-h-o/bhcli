@@ -5,3 +5,4 @@ dist
 *.log
 *.svg
 *.env
+.cargo_home/

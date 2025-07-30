@@ -543,10 +543,18 @@ impl LeChatPHPClient {
         terminal.clear()?;
         terminal.set_cursor(0, 0)?;
 
-        h1.join().unwrap();
-        h2.join().unwrap();
-        h3.join().unwrap();
-        h4.join().unwrap();
+        if let Err(e) = h1.join() {
+            log::error!("keepalive thread panicked: {:?}", e);
+        }
+        if let Err(e) = h2.join() {
+            log::error!("post_msg thread panicked: {:?}", e);
+        }
+        if let Err(e) = h3.join() {
+            log::error!("get_msgs thread panicked: {:?}", e);
+        }
+        if let Err(e) = h4.join() {
+            log::error!("events thread panicked: {:?}", e);
+        }
 
         Ok(terminate_signal)
     }
@@ -3616,8 +3624,14 @@ fn extract_messages(doc: &Document) -> anyhow::Result<Vec<Message>> {
         .filter_map(|tag| {
             let mut id: Option<usize> = None;
             if let Some(checkbox) = tag.find(Name("input")).next() {
-                let id_value: usize = checkbox.attr("value").unwrap().parse().unwrap();
-                id = Some(id_value);
+                if let Some(value_attr) = checkbox.attr("value") {
+                    match value_attr.parse::<usize>() {
+                        Ok(val) => id = Some(val),
+                        Err(e) => eprintln!("Failed to parse message id: {}", e),
+                    }
+                } else {
+                    eprintln!("Expected value attribute on message checkbox");
+                }
             }
             if let Some(date_node) = tag.find(Name("small")).next() {
                 if let Some(msg_span) = tag.find(Name("span")).next() {
