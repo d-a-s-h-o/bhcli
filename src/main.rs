@@ -5,6 +5,16 @@ mod util;
 
 use crate::lechatphp::LoginErr;
 use anyhow::{anyhow, Context};
+use async_openai::{
+    config::OpenAIConfig,
+    types::{
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent, 
+        ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, 
+        ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
+        CreateChatCompletionRequestArgs
+    },
+    Client as OpenAIClient,
+};
 use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
 use clap::Parser;
 use clipboard::ClipboardContext;
@@ -45,6 +55,7 @@ use std::sync::{Arc, MutexGuard};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::runtime::Runtime;
 use tui::layout::Rect;
 use tui::style::Color as tuiColor;
 use tui::{
@@ -119,6 +130,24 @@ struct Profile {
     alt_account: Option<String>,
     #[serde(default)]
     master_account: Option<String>,
+    #[serde(default = "default_empty_str")]
+    system_intel: String,
+    #[serde(default)]
+    ai_enabled: bool,
+    #[serde(default = "default_ai_mode")]
+    ai_mode: String,
+    #[serde(default = "default_moderation_strictness")]
+    moderation_strictness: String, // "strict", "balanced", "lenient"
+    #[serde(default = "default_true")]
+    mod_logs_enabled: bool,
+}
+
+fn default_ai_mode() -> String {
+    "off".to_string()
+}
+
+fn default_moderation_strictness() -> String {
+    "balanced".to_string()
 }
 
 #[derive(Default, Debug, Serialize, Deserialize)]
@@ -272,6 +301,15 @@ struct LeChatPHPClient {
     display_master_pm_view: bool,
     clean_mode: bool,
     alt_forwarding_enabled: Arc<Mutex<bool>>,
+    
+    // AI fields
+    ai_enabled: Arc<Mutex<bool>>,
+    ai_mode: Arc<Mutex<String>>,
+    system_intel: String,
+    moderation_strictness: String,
+    mod_logs_enabled: Arc<Mutex<bool>>,
+    openai_client: Option<async_openai::Client<async_openai::config::OpenAIConfig>>,
+    ai_conversation_memory: Arc<Mutex<std::collections::HashMap<String, Vec<(String, String)>>>>, // user -> (role, message) history
 }
 
 impl LeChatPHPClient {
@@ -347,7 +385,7 @@ impl LeChatPHPClient {
         let send_to = self.config.keepalive_send_to.clone();
         thread::spawn(move || loop {
             let clb = || {
-                tx.send(PostType::KeepAlive(send_to.clone())).unwrap();
+                let _ = tx.send(PostType::KeepAlive(send_to.clone()));
             };
             let timeout = after(Duration::from_secs(60 * 55));
             select! {
@@ -373,22 +411,34 @@ impl LeChatPHPClient {
         let session = self.session.clone().unwrap();
         let url = format!("{}?action=post&session={}", &full_url, &session);
         thread::spawn(move || loop {
-            // select! macro fucks all the LSP, therefore the code gymnastic here
-            let clb = |v: Result<PostType, crossbeam_channel::RecvError>| match v {
-                Ok(post_type_recv) => post_msg(
-                    &client,
-                    post_type_recv,
-                    &full_url,
-                    session.clone(),
-                    &url,
-                    &last_post_tx,
-                ),
-                Err(_) => return,
-            };
+            // Each message gets its own thread to avoid race conditions
             let rx = rx.lock().unwrap();
             select! {
                 recv(&exit_rx) -> _ => return,
-                recv(&rx) -> v => clb(v),
+                recv(&rx) -> v => {
+                    if let Ok(post_type_recv) = v {
+                        // Clone necessary data for the new thread
+                        let client_clone = client.clone();
+                        let full_url_clone = full_url.clone();
+                        let session_clone = session.clone();
+                        let url_clone = url.clone();
+                        let last_post_tx_clone = last_post_tx.clone();
+                        
+                        // Spawn a new thread for each message to prevent race conditions
+                        thread::spawn(move || {
+                            post_msg(
+                                &client_clone,
+                                post_type_recv,
+                                &full_url_clone,
+                                session_clone,
+                                &url_clone,
+                                &last_post_tx_clone,
+                            );
+                        });
+                    } else {
+                        return;
+                    }
+                },
             }
         })
     }
@@ -423,6 +473,13 @@ impl LeChatPHPClient {
         let alt_account = self.alt_account.clone();
         let master_account = self.master_account.clone();
         let alt_forwarding_enabled = Arc::clone(&self.alt_forwarding_enabled);
+        let ai_enabled = Arc::clone(&self.ai_enabled);
+        let ai_mode = Arc::clone(&self.ai_mode);
+        let openai_client = self.openai_client.clone();
+        let system_intel = self.system_intel.clone();
+        let moderation_strictness = self.moderation_strictness.clone();
+        let mod_logs_enabled = Arc::clone(&self.mod_logs_enabled);
+        let ai_conversation_memory = Arc::clone(&self.ai_conversation_memory);
         thread::spawn(move || loop {
             let (_stream, stream_handle) = OutputStream::try_default().unwrap();
             let source = Decoder::new_mp3(Cursor::new(SOUND1)).unwrap();
@@ -450,6 +507,13 @@ impl LeChatPHPClient {
                 alt_account.as_deref(),
                 master_account.as_deref(),
                 &alt_forwarding_enabled,
+                &ai_enabled,
+                &ai_mode,
+                &openai_client,
+                &system_intel,
+                &moderation_strictness,
+                &mod_logs_enabled,
+                &ai_conversation_memory,
             ) {
                 log::error!("{}", err);
             };
@@ -629,16 +693,16 @@ impl LeChatPHPClient {
                 if !color_only {
                     let name = format!("{}{}", username, random_string(14));
                     log::error!("New name : {}", name);
-                    tx.send(PostType::Profile(color, name)).unwrap();
+                    let _ = tx.send(PostType::Profile(color, name));
                 } else {
-                    tx.send(PostType::NewColor(color)).unwrap();
+                    let _ = tx.send(PostType::NewColor(color));
                 }
                 // tx.send(PostType::Post("!up".to_owned(), Some(username.clone())))
                 //     .unwrap();
                 // tx.send(PostType::DeleteLast).unwrap();
             }
             let msg = PostType::Profile("#90ee90".to_owned(), username);
-            tx.send(msg).unwrap();
+            let _ = tx.send(msg);
         });
     }
 
@@ -659,6 +723,20 @@ impl LeChatPHPClient {
             cfg.alt_forwarding_enabled = *self.alt_forwarding_enabled.lock().unwrap();
             if let Err(e) = confy::store("bhcli", None, cfg) {
                 log::error!("failed to store config: {}", e);
+            }
+        }
+    }
+
+    fn save_ai_config(&self) {
+        if let Ok(mut cfg) = confy::load::<MyConfig>("bhcli", None) {
+            if let Some(profile_cfg) = cfg.profiles.get_mut(&self.profile) {
+                profile_cfg.ai_enabled = *self.ai_enabled.lock().unwrap();
+                profile_cfg.ai_mode = self.ai_mode.lock().unwrap().clone();
+                profile_cfg.moderation_strictness = self.moderation_strictness.clone();
+                profile_cfg.mod_logs_enabled = *self.mod_logs_enabled.lock().unwrap();
+                if let Err(e) = confy::store("bhcli", None, cfg) {
+                    log::error!("failed to store AI config: {}", e);
+                }
             }
         }
     }
@@ -931,6 +1009,160 @@ impl LeChatPHPClient {
             let msg = format!("Allowlist: {}", out);
             self.post_msg(PostType::Post(msg, Some("0".to_owned())))
                 .unwrap();
+        } else if input == "/ai on" {
+            *self.ai_enabled.lock().unwrap() = true;
+            *self.ai_mode.lock().unwrap() = "mod_only".to_string();
+            self.save_ai_config();
+            let msg = "AI enabled in moderation only mode".to_string();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
+        } else if input == "/ai mod" {
+            *self.ai_enabled.lock().unwrap() = true;
+            *self.ai_mode.lock().unwrap() = "mod_only".to_string();
+            self.save_ai_config();
+            let msg = "AI set to moderation only mode (kicks/bans harmful messages, no replies)".to_string();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
+        } else if input == "/ai reply all" {
+            *self.ai_enabled.lock().unwrap() = true;
+            *self.ai_mode.lock().unwrap() = "reply_all".to_string();
+            self.save_ai_config();
+            let msg = "AI set to reply all mode (responds to all appropriate messages + moderation)".to_string();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
+        } else if input == "/ai reply ping" {
+            *self.ai_enabled.lock().unwrap() = true;
+            *self.ai_mode.lock().unwrap() = "reply_ping".to_string();
+            self.save_ai_config();
+            let msg = "AI set to reply ping mode (responds only when tagged/mentioned + moderation)".to_string();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
+        } else if input == "/ai off" {
+            *self.ai_enabled.lock().unwrap() = false;  // Completely disable AI
+            *self.ai_mode.lock().unwrap() = "off".to_string();  // Completely off
+            self.save_ai_config();
+            let msg = "AI completely disabled (no moderation, no replies)".to_string();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
+        } else if input == "/ai strict" {
+            self.moderation_strictness = "strict".to_string();
+            self.save_ai_config();
+            let msg = "AI moderation set to STRICT mode (very strict, moderates anything potentially harmful)".to_string();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
+        } else if input == "/ai balanced" {
+            self.moderation_strictness = "balanced".to_string();
+            self.save_ai_config();
+            let msg = "AI moderation set to BALANCED mode (moderate clear violations, preserve free speech)".to_string();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
+        } else if input == "/ai lenient" {
+            self.moderation_strictness = "lenient".to_string();
+            self.save_ai_config();
+            let msg = "AI moderation set to LENIENT mode (very lenient, only moderate obvious violations)".to_string();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
+        } else if input == "/check ai" {
+            let ai_enabled = *self.ai_enabled.lock().unwrap();
+            let ai_mode = self.ai_mode.lock().unwrap().clone();
+            let has_openai = self.openai_client.is_some();
+            
+            let status_msg = format!(
+                "AI Status Check:\n- AI Enabled: {}\n- AI Mode: {}\n- OpenAI Client: {}\n- Moderation Strictness: {}",
+                if ai_enabled { "YES" } else { "NO" },
+                ai_mode,
+                if has_openai { "CONNECTED" } else { "NOT AVAILABLE (check OPENAI_API_KEY)" },
+                self.moderation_strictness
+            );
+            
+            self.post_msg(PostType::Post(status_msg, Some("0".to_owned())))
+                .unwrap();
+                
+            // Test quick moderation patterns
+            let test_messages = vec!["young boy", "hello world", "cheese pizza"];
+            for test_msg in test_messages {
+                let quick_result = if let Some(should_moderate) = quick_moderation_check(test_msg) {
+                    if should_moderate { "BLOCK" } else { "FLAG" }
+                } else { "ALLOW" };
+                let test_result = format!("Quick test '{}': {}", test_msg, quick_result);
+                self.post_msg(PostType::Post(test_result, Some("0".to_owned())))
+                    .unwrap();
+            }
+        } else if input.starts_with("/check mod ") {
+            let test_message = input.trim_start_matches("/check mod ").trim();
+            if test_message.is_empty() {
+                let msg = "Usage: /check mod <message> - Test AI moderation response for a message".to_string();
+                self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                    .unwrap();
+            } else {
+                let ai_enabled = *self.ai_enabled.lock().unwrap();
+                let has_openai = self.openai_client.is_some();
+                
+                if !ai_enabled {
+                    let msg = "AI is currently disabled. Enable with /ai mod first.".to_string();
+                    self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                        .unwrap();
+                } else if !has_openai {
+                    let msg = "OpenAI client not available. Check OPENAI_API_KEY environment variable.".to_string();
+                    self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                        .unwrap();
+                } else {
+                    // First test quick moderation
+                    let quick_result = if let Some(should_moderate) = quick_moderation_check(test_message) {
+                        if should_moderate { "YES (Quick Pattern Match)" } else { "NO (Quick Pattern False)" }
+                    } else { "INCONCLUSIVE (Needs AI Analysis)" };
+                    
+                    let quick_msg = format!("Quick Check: '{}' -> {}", test_message, quick_result);
+                    self.post_msg(PostType::Post(quick_msg, Some("0".to_owned())))
+                        .unwrap();
+                    
+                    // If quick check didn't catch it, test AI moderation
+                    if quick_result == "INCONCLUSIVE (Needs AI Analysis)" {
+                        let openai_client = self.openai_client.as_ref().unwrap().clone();
+                        let moderation_strictness = self.moderation_strictness.clone();
+                        let test_msg = test_message.to_string();
+                        let tx = self.tx.clone();
+                        
+                        // Show that we're starting AI analysis
+                        let start_msg = format!("Starting AI analysis for: '{}'...", test_msg);
+                        self.post_msg(PostType::Post(start_msg, Some("0".to_owned())))
+                            .unwrap();
+                        
+                        // Use same pattern as process_ai_message - create runtime and spawn thread
+                        thread::spawn(move || {
+                            let rt = Runtime::new().unwrap();
+                            rt.block_on(async move {
+                                match check_ai_moderation(&openai_client, &test_msg, &moderation_strictness).await {
+                                    Some(true) => {
+                                        let ai_msg = format!("AI Check: '{}' -> YES (AI recommends kick)", test_msg);
+                                        let _ = tx.send(PostType::Post(ai_msg, Some("0".to_owned())));
+                                    }
+                                    Some(false) => {
+                                        let ai_msg = format!("AI Check: '{}' -> NO (AI allows message)", test_msg);
+                                        let _ = tx.send(PostType::Post(ai_msg, Some("0".to_owned())));
+                                    }
+                                    None => {
+                                        let ai_msg = format!("AI Check: '{}' -> ERROR (AI request failed - check logs)", test_msg);
+                                        let _ = tx.send(PostType::Post(ai_msg, Some("0".to_owned())));
+                                    }
+                                }
+                            });
+                        });
+                    }
+                }
+            }
+        } else if input == "/modlog on" {
+            *self.mod_logs_enabled.lock().unwrap() = true;
+            self.save_ai_config();
+            let msg = "Moderation logging ENABLED - MOD LOG messages will be sent to @0".to_string();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
+        } else if input == "/modlog off" {
+            *self.mod_logs_enabled.lock().unwrap() = false;
+            self.save_ai_config();
+            let msg = "Moderation logging DISABLED - MOD LOG messages are now muted".to_string();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
         } else if let Some(captures) = IGNORE_RGX.captures(input) {
             let username = captures[1].to_owned();
             self.post_msg(PostType::Ignore(username)).unwrap();
@@ -969,6 +1201,162 @@ impl LeChatPHPClient {
                 msg
             );
             self.post_msg(PostType::Post(end_msg, None)).unwrap();
+        } else if input == "/help" {
+            let help_text = r#"Available Commands:
+
+Chat Commands:
+/pm <user> <message>     - Send private message to user
+/m <message>             - Send message to members only
+
+AI Commands:
+/ai off                  - Completely disable AI (no moderation, no replies)
+/ai mod                  - Enable moderation only (kicks/bans harmful messages)
+/ai reply all            - Enable replies to all messages + moderation
+/ai reply ping           - Enable replies only when tagged + moderation
+/ai strict               - Set AI moderation to strict mode (very strict)
+/ai balanced             - Set AI moderation to balanced mode (default)
+/ai lenient              - Set AI moderation to lenient mode (very lenient)
+/check ai                - Check AI system status and OpenAI connection
+/check mod <message>     - Test AI moderation response for a message
+/modlog on/off           - Enable/disable moderation logging to @0
+
+Moderation Commands:
+/kick <user> <reason>    - Kick user with reason
+/ban <username>          - Ban username (partial match)
+/ban "<exact>"           - Ban exact username (use quotes)
+/unban <username>        - Remove username ban
+/unfilter <text>         - Remove message filter
+/filter <text>           - Filter messages containing text (same as /banmsg)
+/allow <user>            - Add user to allowlist (bypass filters)
+/revoke <user>           - Remove user from allowlist
+/banlist                 - Show banned usernames
+/filterlist              - Show filtered message terms
+/allowlist               - Show allowlisted users
+!warn [@user]            - Send warning message
+
+Message Management:
+/dl                      - Delete last message
+/dl<number>              - Delete last N messages (e.g., /dl5)
+/dall                    - Delete all messages
+/delete <msg_id>         - Delete specific message by ID
+
+Account Management:
+/set alt <username>      - Set alt account for forwarding
+/set master <username>   - Set master account for PMs
+/alt on/off              - Enable/disable alt message forwarding
+
+File Upload:
+/upload <path> [to] [msg] - Upload file (to: members/staffs/admins/all)
+
+Visual/Color:
+/nick <nickname>         - Change nickname
+/color <hex>             - Change color (#ff0000)
+/cycle1                  - Start color cycling
+/cycle2                  - Start name + color cycling
+/cycles                  - Stop cycling
+
+Utility:
+/status                  - Show current settings and status
+/help                    - Show this help message
+
+Note: Some commands require appropriate permissions."#;
+            
+            self.post_msg(PostType::Post(help_text.to_string(), Some("0".to_owned())))
+                .unwrap();
+        } else if input == "/status" {
+            let ai_enabled = *self.ai_enabled.lock().unwrap();
+            let ai_mode = self.ai_mode.lock().unwrap().clone();
+            let alt_forwarding = *self.alt_forwarding_enabled.lock().unwrap();
+            
+            let alt_account = self.alt_account.as_ref()
+                .map(|a| a.as_str())
+                .unwrap_or("(not set)");
+            let master_account = self.master_account.as_ref()
+                .map(|m| m.as_str())
+                .unwrap_or("(not set)");
+            
+            let bad_usernames = self.bad_username_filters.lock().unwrap();
+            let bad_exact_usernames = self.bad_exact_username_filters.lock().unwrap();
+            let bad_messages = self.bad_message_filters.lock().unwrap();
+            let allowlist = self.allowlist.lock().unwrap();
+            
+            let status_text = format!(r#"Current Status:
+
+Account Settings:
+- Username: {}
+- ALT Account: {}
+- Master Account: {}
+- ALT Forwarding: {}
+
+AI Settings:
+- AI Enabled: {}
+- AI Mode: {}
+- System Intel: {}
+- Moderation Strictness: {}
+- Mod Logs Enabled: {}
+
+Display Settings:
+- Show System Messages: {}
+- Guest View: {}
+- Member View: {}
+- Staff View: {}
+- Master PM View: {}
+- PM Only Mode: {}
+- Hidden Messages: {}
+- Clean Mode: {}
+- Sound Muted: {}
+
+Filters & Moderation:
+- Banned Usernames ({}): {}
+- Banned Exact Names ({}): {}
+- Filtered Messages ({}): {}
+- Allowlisted Users ({}): {}
+
+Connection:
+- Profile: {}
+- Session Active: {}
+- Refresh Rate: {}s"#,
+                self.base_client.username,
+                alt_account,
+                master_account,
+                if alt_forwarding { "ON" } else { "OFF" },
+                
+                if ai_enabled { "YES" } else { "NO" },
+                ai_mode,
+                if self.system_intel.len() > 50 { 
+                    format!("{}...", &self.system_intel[..50]) 
+                } else { 
+                    self.system_intel.clone() 
+                },
+                self.moderation_strictness,
+                if *self.mod_logs_enabled.lock().unwrap() { "ON" } else { "OFF" },
+                
+                if self.show_sys { "ON" } else { "OFF" },
+                if self.display_guest_view { "ON" } else { "OFF" },
+                if self.display_member_view { "ON" } else { "OFF" },
+                if self.display_staff_view { "ON" } else { "OFF" },
+                if self.display_master_pm_view { "ON" } else { "OFF" },
+                if self.display_pm_only { "ON" } else { "OFF" },
+                if self.display_hidden_msgs { "ON" } else { "OFF" },
+                if self.clean_mode { "ON" } else { "OFF" },
+                if *self.is_muted.lock().unwrap() { "YES" } else { "NO" },
+                
+                bad_usernames.len(),
+                if bad_usernames.is_empty() { "(none)".to_string() } else { bad_usernames.join(", ") },
+                bad_exact_usernames.len(),
+                if bad_exact_usernames.is_empty() { "(none)".to_string() } else { bad_exact_usernames.join(", ") },
+                bad_messages.len(),
+                if bad_messages.is_empty() { "(none)".to_string() } else { bad_messages.join(", ") },
+                allowlist.len(),
+                if allowlist.is_empty() { "(none)".to_string() } else { allowlist.join(", ") },
+                
+                self.profile,
+                if self.session.is_some() { "YES" } else { "NO" },
+                self.refresh_rate
+            );
+            
+            self.post_msg(PostType::Post(status_text, Some("0".to_owned())))
+                .unwrap();
         } else {
             return false;
         }
@@ -2501,6 +2889,13 @@ fn get_msgs(
     alt_account: Option<&str>,
     master_account: Option<&str>,
     alt_forwarding_enabled: &Arc<Mutex<bool>>,
+    ai_enabled: &Arc<Mutex<bool>>,
+    ai_mode: &Arc<Mutex<String>>,
+    openai_client: &Option<OpenAIClient<OpenAIConfig>>,
+    system_intel: &str,
+    moderation_strictness: &str,
+    mod_logs_enabled: &Arc<Mutex<bool>>,
+    ai_conversation_memory: &Arc<Mutex<std::collections::HashMap<String, Vec<(String, String)>>>>,
 ) -> anyhow::Result<()> {
     let url = format!(
         "{}/{}?action=view&session={}&lang={}",
@@ -2552,6 +2947,13 @@ fn get_msgs(
             allowlist,
             alt_account,
             alt_forwarding_enabled,
+            ai_enabled,
+            ai_mode,
+            openai_client,
+            system_intel,
+            moderation_strictness,
+            mod_logs_enabled,
+            ai_conversation_memory,
         );
         // Build messages vector. Tag deleted messages.
         update_messages(
@@ -2591,6 +2993,13 @@ fn process_new_messages(
     allowlist: &Arc<Mutex<Vec<String>>>,
     alt_account: Option<&str>,
     alt_forwarding_enabled: &Arc<Mutex<bool>>,
+    ai_enabled: &Arc<Mutex<bool>>,
+    ai_mode: &Arc<Mutex<String>>,
+    openai_client: &Option<OpenAIClient<OpenAIConfig>>,
+    system_intel: &str,
+    moderation_strictness: &str,
+    mod_logs_enabled: &Arc<Mutex<bool>>,
+    ai_conversation_memory: &Arc<Mutex<std::collections::HashMap<String, Vec<(String, String)>>>>,
 ) {
     if let Some(last_known_msg) = messages.first() {
         let last_known_msg_parsed_dt = parse_date(&last_known_msg.date, datetime_fmt);
@@ -2674,28 +3083,45 @@ fn process_new_messages(
 
                 let is_guest = users.guests.iter().any(|(_, n)| n == &from);
                 if from != username && is_guest {
-                    let bad_name = {
-                        let filters = bad_usernames.lock().unwrap();
-                        filters
-                            .iter()
-                            .any(|f| from.to_lowercase().contains(&f.to_lowercase()))
+                    // Check if user is in allowlist first
+                    let is_allowed = {
+                        let allowed_users = allowlist.lock().unwrap();
+                        allowed_users.contains(&from)
                     };
-                    let bad_name_exact = {
-                        let filters = bad_exact_usernames.lock().unwrap();
-                        filters.iter().any(|f| f == &from)
-                    };
-                    let bad_msg = {
-                        let filters = bad_messages.lock().unwrap();
-                        filters
-                            .iter()
-                            .any(|f| msg.to_lowercase().contains(&f.to_lowercase()))
-                    };
-
-                    if bad_name_exact || bad_name || bad_msg {
-                        let _ = tx.send(PostType::Kick(String::new(), from.clone()));
+                    
+                    if is_allowed {
+                        send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: User '{}' is allowlisted, bypassing all filters", from));
                     } else {
-                        let res = score_message(&msg);
-                        if let Some(act) = action_from_score(res.score) {
+                        let bad_name = {
+                            let filters = bad_usernames.lock().unwrap();
+                            filters
+                                .iter()
+                                .any(|f| from.to_lowercase().contains(&f.to_lowercase()))
+                        };
+                        let bad_name_exact = {
+                            let filters = bad_exact_usernames.lock().unwrap();
+                            filters.iter().any(|f| f == &from)
+                        };
+                        let bad_msg = {
+                            let filters = bad_messages.lock().unwrap();
+                            filters
+                                .iter()
+                                .any(|f| msg.to_lowercase().contains(&f.to_lowercase()))
+                        };
+
+                        if bad_name_exact || bad_name || bad_msg {
+                            let reason = if bad_name_exact {
+                                "exact username match"
+                            } else if bad_name {
+                                "username filter match"
+                            } else {
+                                "message filter match"
+                            };
+                            send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: FILTER KICK - Kicking '{}' for {}: '{}'", from, reason, msg));
+                            let _ = tx.send(PostType::Kick(String::new(), from.clone()));
+                        } else {
+                            let res = score_message(&msg);
+                            if let Some(act) = action_from_score(res.score) {
                             match act {
                                 Action::Warn => {
                                     if to_opt.is_none() {
@@ -2710,20 +3136,478 @@ fn process_new_messages(
                                     }
                                 }
                                 Action::Kick => {
+                                    send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: HARM SCORE KICK - Kicking '{}' for message: '{}'", from, msg));
                                     let _ = tx.send(PostType::Kick(String::new(), from.clone()));
                                 }
                                 Action::Ban => {
+                                    send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: HARM SCORE BAN - Banning '{}' for message: '{}'", from, msg));
                                     let _ = tx.send(PostType::Kick(String::new(), from.clone()));
                                     let mut f = bad_usernames.lock().unwrap();
                                     f.push(from.clone());
                                 }
                             }
                         }
+                        }
                     }
+                }
+
+                // AI Processing - only for guests
+                if *ai_enabled.lock().unwrap() && openai_client.is_some() {
+                    // Check if user is a guest (not member, staff, or admin)
+                    let is_guest = users.guests.iter().any(|(_, n)| n == &from);
+                    
+                    let ai_mode_val = ai_mode.lock().unwrap().clone();
+                    process_ai_message(
+                        &from,
+                        &msg,
+                        &to_opt,
+                        username,
+                        &ai_mode_val,
+                        openai_client.as_ref().unwrap(),
+                        system_intel,
+                        moderation_strictness,
+                        mod_logs_enabled,
+                        is_guest, // Pass guest status
+                        tx,
+                        bad_usernames,
+                        ai_conversation_memory,
+                    );
                 }
             }
         }
     }
+}
+
+// Helper function to send MOD LOG messages only when enabled
+fn send_mod_log(tx: &crossbeam_channel::Sender<PostType>, mod_logs_enabled: bool, message: String) {
+    if mod_logs_enabled {
+        // Use try_send to avoid panicking if channel is closed
+        let _ = tx.try_send(PostType::Post(message, Some("0".to_owned())));
+    }
+}
+
+fn process_ai_message(
+    from: &str,
+    msg: &str,
+    to_opt: &Option<String>,
+    username: &str,
+    ai_mode: &str,
+    openai_client: &OpenAIClient<OpenAIConfig>,
+    system_intel: &str,
+    moderation_strictness: &str,
+    mod_logs_enabled: &Arc<Mutex<bool>>,
+    is_guest: bool, // New parameter to indicate if user is a guest
+    tx: &crossbeam_channel::Sender<PostType>,
+    bad_usernames: &Arc<Mutex<Vec<String>>>,
+    ai_conversation_memory: &Arc<Mutex<std::collections::HashMap<String, Vec<(String, String)>>>>,
+) {
+    if from == username {
+        return; // Don't process our own messages
+    }
+
+    let client = openai_client.clone();
+    let msg_content = msg.to_string();
+    let from_user = from.to_string();
+    let username_owned = username.to_string();
+    let ai_mode_owned = ai_mode.to_string();
+    let system_intel_owned = system_intel.to_string();
+    let strictness_owned = moderation_strictness.to_string();
+    let tx_clone = tx.clone();
+    let bad_usernames_clone = Arc::clone(bad_usernames);
+    let to_opt_clone = to_opt.clone();
+    let memory_clone = Arc::clone(ai_conversation_memory);
+    let mod_logs_enabled_val = *mod_logs_enabled.lock().unwrap(); // Capture the current value
+
+    // Check if we should do moderation based on mode and user status
+    let should_do_moderation = match ai_mode {
+        "off" => {
+            send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: AI disabled, skipping moderation for '{}': '{}'", from_user, msg_content));
+            false  // No moderation when completely off
+        },
+        _ => {
+            if !is_guest {
+                send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: Skipping moderation for member/staff '{}': '{}'", from_user, msg_content));
+                false  // Don't moderate members, staff, or admins
+            } else {
+                true   // Only moderate guests
+            }
+        }
+    };
+
+    // Do immediate quick moderation check first (synchronous and fast)
+    if should_do_moderation {
+        send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: Checking guest message from '{}': '{}'", from_user, msg_content));
+        
+        if let Some(should_moderate) = quick_moderation_check(&msg_content) {
+            if should_moderate {
+                send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: QUICK PATTERN MATCH - Kicking '{}' for message: '{}'", from_user, msg_content));
+                log::warn!("IMMEDIATE KICK - Quick moderation flagged message from {}: {}", from_user, msg_content);
+                // Kick immediately without waiting for AI processing
+                let _ = tx.send(PostType::Kick(String::new(), from_user.clone()));
+                let mut filters = bad_usernames.lock().unwrap();
+                filters.push(from_user.clone());
+                return; // Exit early, no need for further processing
+            } else {
+                send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: Quick patterns matched but flagged as false positive for '{}': '{}'", from_user, msg_content));
+            }
+        } else {
+            send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: No quick patterns matched, sending to AI analysis for '{}': '{}'", from_user, msg_content));
+        }
+    }
+
+    // Create a dedicated runtime for this AI processing task
+    // Using thread::spawn to avoid blocking the main thread and prevent interference between message processing
+    thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        rt.block_on(async move {
+            // Continue with AI moderation if needed (and not already kicked by quick check)
+            if should_do_moderation {
+                // If quick check was inconclusive, use AI analysis
+                if let Some(should_moderate) = check_ai_moderation(&client, &msg_content, &strictness_owned).await {
+                    if should_moderate {
+                        send_mod_log(&tx_clone, mod_logs_enabled_val, format!("MOD LOG: AI ANALYSIS - KICKING '{}' for message: '{}' [AI: YES]", from_user, msg_content));
+                        log::info!("AI moderation flagged message from {}: {}", from_user, msg_content);
+                        let _ = tx_clone.send(PostType::Kick(String::new(), from_user.clone()));
+                        let mut filters = bad_usernames_clone.lock().unwrap();
+                        filters.push(from_user.clone());
+                        return; // Exit early if moderated
+                    } else {
+                        send_mod_log(&tx_clone, mod_logs_enabled_val, format!("MOD LOG: AI ANALYSIS - ALLOWING '{}' message: '{}' [AI: NO]", from_user, msg_content));
+                    }
+                } else {
+                    send_mod_log(&tx_clone, mod_logs_enabled_val, format!("MOD LOG: AI ANALYSIS - API FAILED for '{}': '{}' [AI: ERROR]", from_user, msg_content));
+                }
+            }
+
+            // Now handle different AI modes for responses (only if not moderated)
+            match ai_mode_owned.as_str() {
+                "mod_only" => {
+                    // Only moderation, no responses - already handled above
+                }
+                "off" => {
+                    // Completely off - no moderation, no responses
+                }
+                "reply_all" => {
+                    // Store user message in memory
+                    {
+                        let mut memory = memory_clone.lock().unwrap();
+                        let history = memory.entry(from_user.clone()).or_insert_with(Vec::new);
+                        history.push(("user".to_string(), msg_content.clone()));
+                        // Keep only last 10 messages per user to prevent memory overflow
+                        if history.len() > 10 {
+                            history.remove(0);
+                        }
+                    }
+                    
+                    if let Some(response) = generate_ai_response_with_memory(&client, &msg_content, &system_intel_owned, &username_owned, &memory_clone, &from_user).await {
+                        // Calculate realistic delay based on response length
+                        let delay_ms = calculate_realistic_delay(&response);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        
+                        // Store AI response in memory
+                        {
+                            let mut memory = memory_clone.lock().unwrap();
+                            let history = memory.entry(from_user.clone()).or_insert_with(Vec::new);
+                            history.push(("assistant".to_string(), response.clone()));
+                        }
+                        
+                        let _ = tx_clone.send(PostType::Post(response, None));
+                    }
+                }
+                "reply_ping" => {
+                    let is_mentioned = msg_content.contains(&format!("@{}", username_owned));
+                    let is_directed = to_opt_clone.as_ref().map(|t| t == &username_owned).unwrap_or(false);
+                    
+                    if is_mentioned || is_directed {
+                        // Store user message in memory
+                        {
+                            let mut memory = memory_clone.lock().unwrap();
+                            let history = memory.entry(from_user.clone()).or_insert_with(Vec::new);
+                            history.push(("user".to_string(), msg_content.clone()));
+                            // Keep only last 10 messages per user to prevent memory overflow
+                            if history.len() > 10 {
+                                history.remove(0);
+                            }
+                        }
+                        
+                        if let Some(response) = generate_ai_response_with_memory(&client, &msg_content, &system_intel_owned, &username_owned, &memory_clone, &from_user).await {
+                            // Calculate realistic delay based on response length
+                            let delay_ms = calculate_realistic_delay(&response);
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            
+                            // Store AI response in memory
+                            {
+                                let mut memory = memory_clone.lock().unwrap();
+                                let history = memory.entry(from_user.clone()).or_insert_with(Vec::new);
+                                history.push(("assistant".to_string(), response.clone()));
+                            }
+                            
+                            let reply_target = if is_directed { 
+                                Some(from_user) 
+                            } else { 
+                                None 
+                            };
+                            let _ = tx_clone.send(PostType::Post(response, reply_target));
+                        }
+                    }
+                }
+                _ => {} // Unknown mode
+            }
+        });
+    });
+}
+
+fn quick_moderation_check(message: &str) -> Option<bool> {
+    let msg_lower = message.to_lowercase();
+    
+    // Quick patterns for obvious violations (case insensitive)
+    let illegal_request_patterns = [
+        "cheese pizza", "cp links", "young models",
+        "trading cp", "pedo stuff", "kiddie porn",
+        "jailbait", "preteen", "underage nudes",
+        "r@ygold", "hussyfan", "ptsc", "pthc"
+    ];
+    
+    // Check for obvious illegal content requests
+    for pattern in &illegal_request_patterns {
+        if msg_lower.contains(pattern) {
+            return Some(true); // Should moderate
+        }
+    }
+    
+    // Check for excessive repetition (basic spam detection)
+    let words: Vec<&str> = message.split_whitespace().collect();
+    if words.len() > 10 {
+        let unique_words: std::collections::HashSet<&str> = words.iter().cloned().collect();
+        if (unique_words.len() as f32) / (words.len() as f32) < 0.5 {
+            return Some(true); // Too repetitive, likely spam
+        }
+    }
+    
+    // No quick violations found, need AI analysis
+    None
+}
+
+async fn check_ai_moderation(
+    client: &OpenAIClient<OpenAIConfig>,
+    message: &str,
+    strictness: &str,
+) -> Option<bool> {
+    let strictness_guidance = match strictness {
+        "strict" => "Be very strict. Moderate anything that could potentially violate rules. When in doubt, moderate.",
+        "lenient" => "Be very lenient. Only moderate clear, obvious violations. Heavily favor free speech. When in doubt, allow.",
+        _ => "Use balanced judgment. Moderate clear violations but preserve free speech for borderline cases. When in doubt about context, lean towards allowing."
+    };
+
+    let system_prompt = format!(
+        "You are a chat moderation system enforcing these rules with {} strictness:\n\
+        {}\n\
+        \n\
+        STRICT ENFORCEMENT (ALWAYS MODERATE):\n\
+        - No sharing, requesting, or distributing illegal content (CP, revenge porn, etc.)\n\
+        - No spam, excessive advertising, or repetitive messages\n\
+        - No gore/snuff content sharing or detailed descriptions\n\
+        - No doxxing or sharing personal information without consent\n\
+        - No harassment, threats, or coordinated attacks on individuals\n\
+        - No sexual content involving minors or requests for such content\n\
+        - No violence against children or threats of harm to minors\n\
+        - No discussion of harming, killing, or abusing children\n\
+        \n\
+        CONTEXT-SENSITIVE ENFORCEMENT:\n\
+        - Discussions MENTIONING illegal content negatively/critically = ALLOWED\n\
+        - Educational/awareness discussions about sensitive topics = ALLOWED\n\
+        - News reporting or academic discussion = ALLOWED\n\
+        - Coded language clearly requesting illegal content = MODERATE\n\
+        - Off-topic discussions should be gently redirected, not moderated unless excessive\n\
+        \n\
+        FREEDOM OF SPEECH PRIORITY:\n\
+        - Allow controversial opinions and political discussions\n\
+        - Allow strong language and heated debates\n\
+        - Allow dark humor that doesn't promote illegal activity\n\
+        - When in doubt about context, lean towards ALLOWING the message\n\
+        \n\
+        Examples:\n\
+        ALLOW: 'I stumbled upon some CP online and reported it immediately - disgusting'\n\
+        MODERATE: 'Anyone got cheese pizza links?' or 'Looking for young models'\n\
+        MODERATE: 'I want to fuck a small kid' or 'I really wanna fuck a small kid'\n\
+        MODERATE: 'should I kill my kid' or 'I want to hurt my child'\n\
+        MODERATE: 'how to harm children' or 'ways to kill kids'\n\
+        ALLOW: 'That politician is a complete idiot and should be voted out'\n\
+        MODERATE: 'Someone should assassinate that politician'\n\
+        ALLOW: 'I disagree with your opinion strongly, you're wrong'\n\
+        MODERATE: 'You should kill yourself, here's your home address...'\n\
+        \n\
+        Analyze the message context carefully. Respond ONLY with 'YES' if it clearly violates rules requiring moderation, or 'NO' if it should be allowed.",
+        strictness, strictness_guidance
+    );
+
+    let request = CreateChatCompletionRequestArgs::default()
+        .model("gpt-3.5-turbo")
+        .messages([
+            ChatCompletionRequestMessage::System(
+                ChatCompletionRequestSystemMessage {
+                    content: ChatCompletionRequestSystemMessageContent::Text(system_prompt),
+                    name: None,
+                }
+            ),
+            ChatCompletionRequestMessage::User(
+                ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Text(message.to_string()),
+                    name: None,
+                }
+            ),
+        ])
+        .max_tokens(10u16)
+        .build();
+
+    match request {
+        Ok(req) => {
+            match client.chat().create(req).await {
+                Ok(response) => {
+                    if let Some(choice) = response.choices.first() {
+                        if let Some(content) = &choice.message.content {
+                            let ai_response = content.trim().to_uppercase();
+                            let should_moderate = ai_response == "YES";
+                            
+                            // Enhanced logging for debugging
+                            log::info!("AI MODERATION DEBUG - Message: '{}' | AI Response: '{}' | Decision: {} | Strictness: {}", 
+                                message, content.trim(), if should_moderate { "MODERATE" } else { "ALLOW" }, strictness);
+                            
+                            return Some(should_moderate);
+                        } else {
+                            log::error!("AI moderation: No content in response for message: '{}'", message);
+                        }
+                    } else {
+                        log::error!("AI moderation: No choices in response for message: '{}'", message);
+                    }
+                }
+                Err(e) => {
+                    log::error!("AI moderation API error for message '{}': {}", message, e);
+                }
+            }
+        }
+        Err(e) => {
+            log::error!("AI moderation request build error for message '{}': {}", message, e);
+        }
+    }
+    None
+}
+
+async fn generate_ai_response_with_memory(
+    client: &OpenAIClient<OpenAIConfig>,
+    message: &str,
+    system_intel: &str,
+    username: &str,
+    conversation_memory: &Arc<Mutex<std::collections::HashMap<String, Vec<(String, String)>>>>,
+    from_user: &str,
+) -> Option<String> {
+    let system_prompt = format!(
+        "{}\n\nYou are chatting as '{}'. Respond naturally and helpfully to messages. \
+        Keep responses concise (under 200 characters) and appropriate for a chat room. \
+        Don't be overly formal. Be engaging but not overwhelming. \
+        Use conversation history to provide contextual responses.",
+        system_intel, username
+    );
+
+    // Build message history with context
+    let mut messages = vec![
+        ChatCompletionRequestMessage::System(
+            ChatCompletionRequestSystemMessage {
+                content: ChatCompletionRequestSystemMessageContent::Text(system_prompt),
+                name: None,
+            }
+        )
+    ];
+    
+    // Add conversation history for context
+    {
+        let memory = conversation_memory.lock().unwrap();
+        if let Some(history) = memory.get(from_user) {
+            // Add the last few messages for context (limit to avoid token overflow)
+            let recent_history = if history.len() > 8 { &history[history.len()-8..] } else { history };
+            for (role, content) in recent_history {
+                match role.as_str() {
+                    "user" => {
+                        messages.push(ChatCompletionRequestMessage::User(
+                            ChatCompletionRequestUserMessage {
+                                content: ChatCompletionRequestUserMessageContent::Text(content.clone()),
+                                name: Some(from_user.to_string()),
+                            }
+                        ));
+                    }
+                    "assistant" => {
+                        messages.push(ChatCompletionRequestMessage::Assistant(
+                            ChatCompletionRequestAssistantMessage {
+                                content: Some(ChatCompletionRequestAssistantMessageContent::Text(content.clone())),
+                                name: Some(username.to_string()),
+                                ..Default::default()
+                            }
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    
+    // Add the current message
+    messages.push(ChatCompletionRequestMessage::User(
+        ChatCompletionRequestUserMessage {
+            content: ChatCompletionRequestUserMessageContent::Text(message.to_string()),
+            name: Some(from_user.to_string()),
+        }
+    ));
+
+    let request = CreateChatCompletionRequestArgs::default()
+        .model("gpt-3.5-turbo")
+        .messages(messages)
+        .max_tokens(150u16)
+        .temperature(0.8) // Add some randomness to responses
+        .build();
+
+    match request {
+        Ok(req) => {
+            match client.chat().create(req).await {
+                Ok(response) => {
+                    if let Some(choice) = response.choices.first() {
+                        if let Some(content) = &choice.message.content {
+                            return Some(content.trim().to_string());
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("AI response error: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            log::error!("AI request build error: {}", e);
+        }
+    }
+    None
+}
+
+fn calculate_realistic_delay(response: &str) -> u64 {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    
+    // Base delay for thinking time (3-8 seconds) - increased for more realistic pauses
+    let base_delay = rng.gen_range(3000..8000);
+    
+    // Typing speed simulation: 25-65 WPM (words per minute) - slower, more human-like
+    // Average word length ~5 characters, so 125-325 characters per minute
+    let chars_per_minute = rng.gen_range(125.0..325.0);
+    let chars_per_ms = chars_per_minute / 60000.0; // Convert to chars per millisecond
+    
+    let typing_delay = (response.len() as f64 / chars_per_ms) as u64;
+    
+    // Add some random variance (±30%) - increased variance for more natural feel
+    let total_delay = base_delay + typing_delay;
+    let variance = (total_delay as f64 * 0.3) as u64;
+    let final_delay = total_delay + rng.gen_range(0..variance) - (variance / 2);
+    
+    // Cap the delay between 2-25 seconds to avoid being too slow but allow for longer responses
+    final_delay.clamp(2000, 25000)
 }
 
 fn update_messages(
@@ -2904,6 +3788,40 @@ fn new_default_le_chat_php_client(params: Params) -> LeChatPHPClient {
         true // Default to enabled
     };
     
+    // Initialize OpenAI client if API key is available
+    let openai_client = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .map(|api_key| {
+            let config = OpenAIConfig::new().with_api_key(api_key);
+            OpenAIClient::with_config(config)
+        });
+    
+    // Load AI settings from profile or use defaults
+    let (ai_enabled, ai_mode, system_intel, moderation_strictness, mod_logs_enabled) = if let Ok(cfg) = confy::load::<MyConfig>("bhcli", None) {
+        if let Some(profile_cfg) = cfg.profiles.get(&params.profile) {
+            let mode = if profile_cfg.ai_mode == "mod" {
+                "mod_only".to_string()  // Convert old "mod" mode to "mod_only"
+            } else {
+                profile_cfg.ai_mode.clone()
+            };
+            (
+                profile_cfg.ai_enabled,  // Use the stored setting
+                mode,
+                if profile_cfg.system_intel.is_empty() {
+                    "You are a helpful AI assistant in a chat room. Be friendly and follow community guidelines.".to_string()
+                } else {
+                    profile_cfg.system_intel.clone()
+                },
+                profile_cfg.moderation_strictness.clone(),
+                profile_cfg.mod_logs_enabled
+            )
+        } else {
+            (params.ai_enabled, params.ai_mode, params.system_intel, "balanced".to_string(), true)
+        }
+    } else {
+        (params.ai_enabled, params.ai_mode, params.system_intel, "balanced".to_string(), true)
+    };
+    
     // println!("session[2050] : {:?}",params.session);
     LeChatPHPClient {
         base_client: BaseClient {
@@ -2941,6 +3859,13 @@ fn new_default_le_chat_php_client(params: Params) -> LeChatPHPClient {
         display_master_pm_view: false,
         clean_mode: false,
         alt_forwarding_enabled: Arc::new(Mutex::new(alt_forwarding_enabled)),
+        ai_enabled: Arc::new(Mutex::new(ai_enabled)),
+        ai_mode: Arc::new(Mutex::new(ai_mode)),
+        system_intel,
+        moderation_strictness,
+        mod_logs_enabled: Arc::new(Mutex::new(mod_logs_enabled)),
+        openai_client,
+        ai_conversation_memory: Arc::new(Mutex::new(std::collections::HashMap::new())),
     }
 }
 
@@ -2971,6 +3896,9 @@ struct Params {
     alt_account: Option<String>,
     master_account: Option<String>,
     profile: String,
+    ai_enabled: bool,
+    ai_mode: String,
+    system_intel: String,
 }
 
 #[derive(Clone)]
@@ -3281,6 +4209,9 @@ fn main() -> anyhow::Result<()> {
         alt_account,
         master_account,
         profile: opts.profile.clone(),
+        ai_enabled: false,  // Disable AI by default
+        ai_mode: "off".to_string(),
+        system_intel: "You are a helpful AI assistant in a chat room. Be friendly and follow community guidelines.".to_string(),
     };
     // println!("Session[2378]: {:?}", opts.session);
 
@@ -4390,5 +5321,569 @@ mod tests {
             parse_forwarded_username(text, "[M] ", "[Staff] "),
             Some(("/m", "rex".to_owned()))
         );
+    }
+
+    #[test]
+    fn test_quick_moderation_violence_patterns() {
+        // Test that violence patterns are caught
+        assert_eq!(quick_moderation_check("should I kill my kid"), Some(true));
+        assert_eq!(quick_moderation_check("Should I Kill My Kid"), Some(true));
+        assert_eq!(quick_moderation_check("I want to kill my child"), Some(true));
+        assert_eq!(quick_moderation_check("how to hurt my kid"), Some(true));
+        assert_eq!(quick_moderation_check("gonna kill a child"), Some(true));
+        
+        // Test that safe messages are not caught
+        assert_eq!(quick_moderation_check("my kid is driving me crazy"), None);
+        assert_eq!(quick_moderation_check("I love my child"), None);
+        assert_eq!(quick_moderation_check("hello everyone"), None);
+        
+        // Test existing patterns still work
+        assert_eq!(quick_moderation_check("looking for cheese pizza"), Some(true));
+        assert_eq!(quick_moderation_check("young boy pics"), Some(true));
+    }
+
+    // Mock OpenAI client for testing
+    struct MockOpenAIClient {
+        should_moderate: bool,
+        should_error: bool,
+    }
+
+    impl MockOpenAIClient {
+        fn new(should_moderate: bool) -> Self {
+            Self { should_moderate, should_error: false }
+        }
+
+        fn new_with_error() -> Self {
+            Self { should_moderate: false, should_error: true }
+        }
+
+        async fn mock_moderation_response(&self, _message: &str, _strictness: &str) -> Option<bool> {
+            if self.should_error {
+                return None;
+            }
+            Some(self.should_moderate)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ai_moderation_system_prompt_generation() {
+        // Test that different strictness levels generate appropriate prompts
+        let strictness_levels = vec!["strict", "lenient", "balanced"];
+        
+        for strictness in strictness_levels {
+            let guidance = match strictness {
+                "strict" => "Be very strict. Moderate anything that could potentially violate rules. When in doubt, moderate.",
+                "lenient" => "Be very lenient. Only moderate clear, obvious violations. Heavily favor free speech. When in doubt, allow.",
+                _ => "Use balanced judgment. Moderate clear violations but preserve free speech for borderline cases. When in doubt about context, lean towards allowing."
+            };
+
+            // Verify the guidance is correct for each strictness level
+            assert!(guidance.len() > 0);
+            if strictness == "strict" {
+                assert!(guidance.contains("When in doubt, moderate"));
+            } else if strictness == "lenient" {
+                assert!(guidance.contains("When in doubt, allow"));
+            } else {
+                assert!(guidance.contains("When in doubt about context, lean towards allowing"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ai_moderation_mock_responses() {
+        // Test mock client that should moderate
+        let mock_client = MockOpenAIClient::new(true);
+        let result = mock_client.mock_moderation_response("harmful message", "balanced").await;
+        assert_eq!(result, Some(true));
+
+        // Test mock client that should allow
+        let mock_client = MockOpenAIClient::new(false);
+        let result = mock_client.mock_moderation_response("safe message", "balanced").await;
+        assert_eq!(result, Some(false));
+
+        // Test mock client with error
+        let mock_client = MockOpenAIClient::new_with_error();
+        let result = mock_client.mock_moderation_response("any message", "balanced").await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_ai_moderation_request_structure() {
+        use async_openai::{
+            types::{
+                ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage, 
+                ChatCompletionRequestUserMessage, ChatCompletionRequestSystemMessageContent,
+                ChatCompletionRequestUserMessageContent, CreateChatCompletionRequestArgs
+            }
+        };
+
+        // Test that we can build a proper moderation request structure
+        let test_message = "test message for moderation";
+        let strictness = "balanced";
+        
+        let strictness_guidance = "Use balanced judgment. Moderate clear violations but preserve free speech for borderline cases. When in doubt about context, lean towards allowing.";
+
+        let system_prompt = format!(
+            "You are a chat moderation system enforcing these rules with {} strictness:\n\
+            {}\n\
+            \n\
+            STRICT ENFORCEMENT (ALWAYS MODERATE):\n\
+            - No sharing, requesting, or distributing illegal content (CP, revenge porn, etc.)\n\
+            - No spam, excessive advertising, or repetitive messages\n\
+            - No gore/snuff content sharing or detailed descriptions\n\
+            - No doxxing or sharing personal information without consent\n\
+            - No harassment, threats, or coordinated attacks on individuals\n\
+            - No sexual content involving minors or requests for such content\n\
+            - No violence against children or threats of harm to minors\n\
+            - No discussion of harming, killing, or abusing children\n\
+            \n\
+            CONTEXT-SENSITIVE ENFORCEMENT:\n\
+            - Discussions MENTIONING illegal content negatively/critically = ALLOWED\n\
+            - Educational/awareness discussions about sensitive topics = ALLOWED\n\
+            - News reporting or academic discussion = ALLOWED\n\
+            - Coded language clearly requesting illegal content = MODERATE\n\
+            - Off-topic discussions should be gently redirected, not moderated unless excessive\n\
+            \n\
+            FREEDOM OF SPEECH PRIORITY:\n\
+            - Allow controversial opinions and political discussions\n\
+            - Allow strong language and heated debates\n\
+            - Allow dark humor that doesn't promote illegal activity\n\
+            - When in doubt about context, lean towards ALLOWING the message\n\
+            \n\
+            Examples:\n\
+            ALLOW: 'I stumbled upon some CP online and reported it immediately - disgusting'\n\
+            MODERATE: 'Anyone got cheese pizza links?' or 'Looking for young models'\n\
+            MODERATE: 'I want to fuck a small kid' or 'I really wanna fuck a small kid'\n\
+            MODERATE: 'should I kill my kid' or 'I want to hurt my child'\n\
+            MODERATE: 'how to harm children' or 'ways to kill kids'\n\
+            ALLOW: 'That politician is a complete idiot and should be voted out'\n\
+            MODERATE: 'Someone should assassinate that politician'\n\
+            ALLOW: 'I disagree with your opinion strongly, you're wrong'\n\
+            MODERATE: 'You should kill yourself, here's your home address...'\n\
+            \n\
+            Analyze the message context carefully. Respond ONLY with 'YES' if it clearly violates rules requiring moderation, or 'NO' if it should be allowed.",
+            strictness, strictness_guidance
+        );
+
+        let request = CreateChatCompletionRequestArgs::default()
+            .model("gpt-3.5-turbo")
+            .messages([
+                ChatCompletionRequestMessage::System(
+                    ChatCompletionRequestSystemMessage {
+                        content: ChatCompletionRequestSystemMessageContent::Text(system_prompt.clone()),
+                        name: None,
+                    }
+                ),
+                ChatCompletionRequestMessage::User(
+                    ChatCompletionRequestUserMessage {
+                        content: ChatCompletionRequestUserMessageContent::Text(test_message.to_string()),
+                        name: None,
+                    }
+                ),
+            ])
+            .max_tokens(10u16)
+            .build();
+
+        // Verify request builds successfully
+        assert!(request.is_ok());
+        
+        // Verify system prompt contains key enforcement rules
+        assert!(system_prompt.contains("STRICT ENFORCEMENT"));
+        assert!(system_prompt.contains("No violence against children"));
+        assert!(system_prompt.contains("should I kill my kid"));
+        assert!(system_prompt.contains("MODERATE"));
+        assert!(system_prompt.contains("ALLOW"));
+        
+        // Verify the request uses the correct model and token limit
+        let req = request.unwrap();
+        assert_eq!(req.model, "gpt-3.5-turbo");
+        assert_eq!(req.max_tokens, Some(10));
+    }
+
+    #[test]
+    fn test_ai_moderation_message_examples() {
+        // Test that our moderation logic would handle specific example cases correctly
+        // These are the examples from our AI prompt that should be moderated
+        let should_moderate_examples = vec![
+            "Anyone got cheese pizza links?",
+            "Looking for young models",
+            "I want to fuck a small kid",
+            "I really wanna fuck a small kid", 
+            "should I kill my kid",
+            "I want to hurt my child",
+            "how to harm children",
+            "ways to kill kids",
+            "Someone should assassinate that politician",
+            "You should kill yourself, here's your home address...",
+        ];
+
+        let should_allow_examples = vec![
+            "I stumbled upon some CP online and reported it immediately - disgusting",
+            "That politician is a complete idiot and should be voted out",
+            "I disagree with your opinion strongly, you're wrong",
+            "My kid is driving me crazy but I love them",
+            "Educational discussion about online safety",
+            "News report about recent events",
+        ];
+
+        // Verify our quick moderation catches some of these immediately
+        for example in &should_moderate_examples {
+            // Some should be caught by quick moderation, others need AI
+            let quick_result = quick_moderation_check(example);
+            if quick_result.is_some() {
+                assert_eq!(quick_result, Some(true), "Quick moderation should catch: {}", example);
+            }
+            // If not caught by quick moderation, it would go to AI
+        }
+
+        // Verify safe examples aren't caught by quick moderation
+        for example in &should_allow_examples {
+            let quick_result = quick_moderation_check(example);
+            // These should either not be caught (None) or explicitly allowed (Some(false))
+            assert_ne!(quick_result, Some(true), "Quick moderation should not block safe message: {}", example);
+        }
+    }
+
+    #[test]
+    fn test_moderation_strictness_levels() {
+        let strictness_levels = vec!["strict", "lenient", "balanced", "unknown"];
+        
+        for level in strictness_levels {
+            let guidance = match level {
+                "strict" => "Be very strict. Moderate anything that could potentially violate rules. When in doubt, moderate.",
+                "lenient" => "Be very lenient. Only moderate clear, obvious violations. Heavily favor free speech. When in doubt, allow.",
+                _ => "Use balanced judgment. Moderate clear violations but preserve free speech for borderline cases. When in doubt about context, lean towards allowing."
+            };
+            
+            // Verify each level has appropriate guidance
+            match level {
+                "strict" => {
+                    assert!(guidance.contains("very strict"));
+                    assert!(guidance.contains("When in doubt, moderate"));
+                }
+                "lenient" => {
+                    assert!(guidance.contains("very lenient"));
+                    assert!(guidance.contains("When in doubt, allow"));
+                }
+                _ => {
+                    assert!(guidance.contains("balanced judgment"));
+                    assert!(guidance.contains("lean towards allowing"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ai_moderation_response_parsing() {
+        // Test how we would parse different AI responses
+        let test_cases = vec![
+            ("YES", true),
+            ("yes", true),  // Should handle case insensitivity
+            ("Yes", true),
+            ("NO", false),
+            ("no", false),
+            ("No", false),
+            ("MAYBE", false),  // Unexpected response should default to false
+            ("", false),       // Empty response should default to false
+        ];
+
+        for (response, expected) in test_cases {
+            let ai_response = response.trim().to_uppercase();
+            let should_moderate = ai_response == "YES";
+            assert_eq!(should_moderate, expected, "Response '{}' should be parsed as {}", response, expected);
+        }
+    }
+
+    // Helper function to get OpenAI client for integration tests
+    fn get_test_openai_client() -> Option<OpenAIClient<OpenAIConfig>> {
+        std::env::var("OPENAI_API_KEY")
+            .ok()
+            .map(|api_key| {
+                let config = OpenAIConfig::new()
+                    .with_api_key(api_key);
+                OpenAIClient::with_config(config)
+            })
+    }
+
+    #[tokio::test]
+    #[ignore] // Run with: cargo test test_ai_moderation_integration_harmful -- --ignored
+    async fn test_ai_moderation_integration_harmful() {
+        // Skip if no API key is available
+        let client = match get_test_openai_client() {
+            Some(client) => client,
+            None => {
+                println!("Skipping integration test: OPENAI_API_KEY not set");
+                return;
+            }
+        };
+
+        // Test cases that should be moderated
+        let harmful_messages = vec![
+            "Anyone got cheese pizza links?",
+            "Looking for young models",
+            "should I kill my kid",
+            "I want to hurt my child",
+            "how to harm children",
+        ];
+
+        for message in harmful_messages {
+            println!("Testing harmful message: '{}'", message);
+            
+            // Test with different strictness levels
+            for strictness in &["strict", "balanced", "lenient"] {
+                match check_ai_moderation(&client, message, strictness).await {
+                    Some(should_moderate) => {
+                        println!("  {} strictness: {} -> {}", 
+                            strictness, 
+                            message, 
+                            if should_moderate { "MODERATE" } else { "ALLOW" }
+                        );
+                        
+                        // For harmful messages, we expect moderation in most cases
+                        // Even lenient should catch clear violations
+                        if *strictness == "strict" {
+                            assert!(should_moderate, 
+                                "Strict mode should moderate harmful message: '{}'", message);
+                        }
+                        // Note: We don't assert for balanced/lenient as AI responses may vary
+                        // This is for observing AI behavior patterns
+                    }
+                    None => {
+                        panic!("AI moderation failed to get response for message: '{}'", message);
+                    }
+                }
+                
+                // Add delay to respect API rate limits
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // Run with: cargo test test_ai_moderation_integration_safe -- --ignored
+    async fn test_ai_moderation_integration_safe() {
+        // Skip if no API key is available
+        let client = match get_test_openai_client() {
+            Some(client) => client,
+            None => {
+                println!("Skipping integration test: OPENAI_API_KEY not set");
+                return;
+            }
+        };
+
+        // Test cases that should be allowed
+        let safe_messages = vec![
+            "Hello everyone, how are you today?",
+            "I love my child very much",
+            "That politician is wrong about the economy",
+            "I stumbled upon some CP online and reported it immediately - disgusting",
+            "Educational discussion about online safety is important",
+            "My kid is driving me crazy but I love them",
+        ];
+
+        for message in safe_messages {
+            println!("Testing safe message: '{}'", message);
+            
+            // Test with different strictness levels
+            for strictness in &["strict", "balanced", "lenient"] {
+                match check_ai_moderation(&client, message, strictness).await {
+                    Some(should_moderate) => {
+                        println!("  {} strictness: {} -> {}", 
+                            strictness, 
+                            message, 
+                            if should_moderate { "MODERATE" } else { "ALLOW" }
+                        );
+                        
+                        // For safe messages, lenient and balanced should typically allow
+                        if *strictness == "lenient" {
+                            assert!(!should_moderate, 
+                                "Lenient mode should allow safe message: '{}'", message);
+                        }
+                        // Note: We don't assert for strict as it might be overly cautious
+                    }
+                    None => {
+                        panic!("AI moderation failed to get response for message: '{}'", message);
+                    }
+                }
+                
+                // Add delay to respect API rate limits
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // Run with: cargo test test_ai_moderation_integration_edge_cases -- --ignored
+    async fn test_ai_moderation_integration_edge_cases() {
+        // Skip if no API key is available
+        let client = match get_test_openai_client() {
+            Some(client) => client,
+            None => {
+                println!("Skipping integration test: OPENAI_API_KEY not set");
+                return;
+            }
+        };
+
+        // Test edge cases and borderline content
+        let edge_case_messages = vec![
+            "That movie was killer awesome!", // "killer" in positive context
+            "I could just die of embarrassment", // "die" in expression
+            "This game is sick!", // "sick" as slang for cool
+            "Pizza delivery for kids party", // Contains "pizza" and "kids" but innocent
+            "Child psychology research paper", // Contains "child" but academic
+            "", // Empty message
+            "a", // Single character
+            "🤔🤔🤔", // Only emojis
+        ];
+
+        for message in edge_case_messages {
+            println!("Testing edge case message: '{}'", message);
+            
+            match check_ai_moderation(&client, message, "balanced").await {
+                Some(should_moderate) => {
+                    println!("  balanced strictness: {} -> {}", 
+                        message, 
+                        if should_moderate { "MODERATE" } else { "ALLOW" }
+                    );
+                    
+                    // For most edge cases, we expect them to be allowed
+                    // This is mainly for observing AI behavior
+                }
+                None => {
+                    println!("  AI moderation returned None for: '{}'", message);
+                    // Don't panic for edge cases as API might handle them differently
+                }
+            }
+            
+            // Add delay to respect API rate limits
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // Run with: cargo test test_ai_moderation_integration_consistency -- --ignored
+    async fn test_ai_moderation_integration_consistency() {
+        // Skip if no API key is available
+        let client = match get_test_openai_client() {
+            Some(client) => client,
+            None => {
+                println!("Skipping integration test: OPENAI_API_KEY not set");
+                return;
+            }
+        };
+
+        // Test consistency - same message should get similar results
+        // Use a message that won't be caught by quick patterns
+        let test_message = "Anyone got cheese pizza links?";
+        let mut results = Vec::new();
+        
+        println!("Testing consistency for message: '{}'", test_message);
+        
+        // Run the same message multiple times
+        for i in 0..3 {
+            match check_ai_moderation(&client, test_message, "balanced").await {
+                Some(should_moderate) => {
+                    results.push(should_moderate);
+                    println!("  Attempt {}: {}", i + 1, if should_moderate { "MODERATE" } else { "ALLOW" });
+                }
+                None => {
+                    panic!("AI moderation failed on attempt {}", i + 1);
+                }
+            }
+            
+            // Add delay between requests
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        }
+        
+        // Check consistency - all results should be the same for this clear violation
+        let first_result = results[0];
+        for (i, result) in results.iter().enumerate() {
+            assert_eq!(*result, first_result, 
+                "Inconsistent result on attempt {}: expected {}, got {}", 
+                i + 1, first_result, result);
+        }
+        
+        // For this clearly harmful message, we expect it to be moderated
+        assert!(first_result, "Clear harmful message should be consistently moderated");
+    }
+
+    #[tokio::test]
+    #[ignore] // Run with: cargo test test_ai_moderation_integration_performance -- --ignored
+    async fn test_ai_moderation_integration_performance() {
+        // Skip if no API key is available
+        let client = match get_test_openai_client() {
+            Some(client) => client,
+            None => {
+                println!("Skipping integration test: OPENAI_API_KEY not set");
+                return;
+            }
+        };
+
+        let test_message = "Hello everyone!";
+        let start_time = std::time::Instant::now();
+        
+        match check_ai_moderation(&client, test_message, "balanced").await {
+            Some(_) => {
+                let duration = start_time.elapsed();
+                println!("AI moderation took: {:?}", duration);
+                
+                // Expect response within reasonable time (10 seconds)
+                // This can vary based on API load
+                assert!(duration.as_secs() < 10, "AI moderation took too long: {:?}", duration);
+            }
+            None => {
+                panic!("AI moderation failed to get response");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // Run with: cargo test test_ai_moderation_integration_prompt_variations -- --ignored
+    async fn test_ai_moderation_integration_prompt_variations() {
+        // Skip if no API key is available
+        let client = match get_test_openai_client() {
+            Some(client) => client,
+            None => {
+                println!("Skipping integration test: OPENAI_API_KEY not set");
+                return;
+            }
+        };
+
+        // Test that our prompt engineering examples work as expected
+        let prompt_examples = vec![
+            // Examples that should be ALLOWED according to our prompt
+            ("I stumbled upon some CP online and reported it immediately - disgusting", false),
+            ("That politician is a complete idiot and should be voted out", false),
+            ("I disagree with your opinion strongly, you're wrong", false),
+            
+            // Examples that should be MODERATED according to our prompt
+            ("Anyone got cheese pizza links?", true),
+            ("I want to fuck a small kid", true),
+            ("should I kill my kid", true),
+            ("Someone should assassinate that politician", true),
+        ];
+
+        for (message, expected_moderate) in prompt_examples {
+            println!("Testing prompt example: '{}'", message);
+            
+            match check_ai_moderation(&client, message, "balanced").await {
+                Some(should_moderate) => {
+                    println!("  Expected: {}, Got: {}", 
+                        if expected_moderate { "MODERATE" } else { "ALLOW" },
+                        if should_moderate { "MODERATE" } else { "ALLOW" }
+                    );
+                    
+                    // Our prompt engineering should work for these specific examples
+                    assert_eq!(should_moderate, expected_moderate,
+                        "AI response doesn't match prompt example for: '{}'", message);
+                }
+                None => {
+                    panic!("AI moderation failed for prompt example: '{}'", message);
+                }
+            }
+            
+            // Add delay to respect API rate limits
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
     }
 }

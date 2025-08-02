@@ -154,3 +154,112 @@ bad_messages = ["buy now", "free money"]
 Filters modified using `/ban`, `/ban "name"`, `/filter`, `/unban` and `/unfilter` are saved
 back to this file automatically and any custom commands in the `[commands]`
 section are preserved.
+
+## Command Line Arguments
+
+BHCLI supports various command-line arguments for configuration and customization:
+
+### Authentication & Profile
+- `-u, --username <USERNAME>` - Set username (can also use `BHC_USERNAME` env var)
+- `-p, --password <PASSWORD>` - Set password (can also use `BHC_PASSWORD` env var)
+- `-c, --profile <PROFILE>` - Select configuration profile (default: "default")
+- `--session <SESSION>` - Use existing session ID to skip login
+
+### Connection & Network
+- `--url <URL>` - Override chat server URL
+- `--page-php <PAGE>` - Override chat page filename (default: chat.php)
+- `-s, --socks-proxy-url <URL>` - SOCKS proxy URL (default: socks5h://127.0.0.1:9050, can use `BHC_PROXY_URL` env var)
+- `--no-proxy` - Disable proxy usage
+- `--datetime-fmt <FORMAT>` - Override datetime format string
+- `--members-tag <TAG>` - Override members tag format
+
+### Display & Behavior
+- `-g, --guest-color <COLOR>` - Set guest color theme
+- `-m, --manual-captcha` - Enable manual captcha solving (can also use `BHC_MANUAL_CAPTCHA` env var)
+- `-r, --refresh-rate <SECONDS>` - Message refresh rate in seconds (default: 5, can use `BHC_REFRESH_RATE` env var)
+- `--max-login-retry <COUNT>` - Maximum login retry attempts (default: 5, can use `BHC_MAX_LOGIN_RETRY` env var)
+- `--sxiv` - Enable sxiv image viewer integration
+
+### Integrations
+- `--dkf-api-key <KEY>` - DKF API key for notifications (can also use `DKF_API_KEY` env var)
+- `--dnmx-username <USERNAME>` - DNMX email username (can also use `DNMX_USERNAME` env var)
+- `--dnmx-password <PASSWORD>` - DNMX email password (can also use `DNMX_PASSWORD` env var)
+
+### Advanced Options
+- `-d, --dan` - Enable special DAN mode features
+- `--keepalive-send-to <TARGET>` - Override keepalive message target (default: "0")
+
+### Usage Examples
+
+```bash
+# Basic usage with username and password
+bhcli -u myusername -p mypassword
+
+# Use a specific profile
+bhcli -c myprofile
+
+# Connect through different proxy
+bhcli -s socks5h://127.0.0.1:9150
+
+# Disable proxy completely
+bhcli --no-proxy
+
+# Use custom refresh rate
+bhcli -r 3
+
+# Connect to different chat server
+bhcli --url "http://example.onion" --page-php "chat.php"
+
+# Enable manual captcha solving
+bhcli -m
+
+# Use environment variables
+export BHC_USERNAME="myuser"
+export BHC_PASSWORD="mypass"
+export BHC_PROXY_URL="socks5h://127.0.0.1:9150"
+bhcli
+```
+
+Most settings can be configured via environment variables or saved in the configuration file for persistent use across sessions.
+
+## Changelog
+
+### Recent Updates (August 2025)
+
+#### AI Moderation System
+- **Added AI-powered moderation** with OpenAI integration for automated content filtering
+- **Guest-only moderation**: AI moderation only applies to guests, members/staff/admins are exempt
+- **Multi-layered protection**: Quick pattern matching + AI analysis for comprehensive coverage
+- **AI conversation modes**:
+  - `/ai off` - Completely disable AI
+  - `/ai mod` - Enable moderation only  
+  - `/ai reply all` - Enable replies to all messages + moderation
+  - `/ai reply ping` - Enable replies only when tagged + moderation
+- **Moderation strictness levels**: `/ai strict`, `/ai balanced`, `/ai lenient`
+- **Enhanced pattern detection**: Comprehensive quick patterns for immediate filtering of inappropriate content
+- **AI testing commands**: `/check ai` for system status, `/check mod <message>` to test moderation
+
+#### Moderation Logging System
+- **Added `/modlog on/off`** - Toggle moderation logging to admin channel (@0)
+- **Detailed mod logs**: Track all moderation decisions, pattern matches, and AI analysis
+- **Configurable logging**: Per-profile mod log settings saved to config
+
+#### Message Threading & Performance
+- **Per-message threading**: Each message now sends in its own thread to eliminate race conditions
+- **Concurrent message processing**: User messages and system messages (AI, moderation) no longer block each other
+- **Non-blocking channel operations**: Prevents deadlocks and improves responsiveness
+- **Better concurrent handling**: Multiple messages can be sent simultaneously without interference
+
+#### Enhanced Content Filtering
+- **Expanded quick patterns**: Added comprehensive detection for inappropriate content involving minors
+- **Improved spam detection**: Better recognition of repetitive/spam content
+- **Allowlist bypass**: Allowlisted users bypass all content filters
+- **Separated AI functions**: AI moderation and conversational AI now use different prompts for better accuracy
+
+#### Technical Improvements
+- **Thread-safe message sending**: All message operations now use dedicated threads
+- **Improved error handling**: Better channel error management with try_send patterns
+- **Enhanced logging**: More detailed moderation and system logs
+- **Configuration persistence**: AI settings and mod log preferences saved per profile
+
+These updates significantly improve the chat moderation capabilities while maintaining performance and preventing race conditions in message handling.
