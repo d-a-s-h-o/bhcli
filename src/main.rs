@@ -97,6 +97,10 @@ fn default_empty_str() -> String {
     "".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Profile {
     username: String,
@@ -124,6 +128,8 @@ struct MyConfig {
     alt_account: Option<String>,
     #[serde(default)]
     master_account: Option<String>,
+    #[serde(default = "default_true")]
+    alt_forwarding_enabled: bool,
     #[serde(default)]
     bad_usernames: Vec<String>,
     #[serde(default)]
@@ -265,6 +271,7 @@ struct LeChatPHPClient {
     display_staff_view: bool,
     display_master_pm_view: bool,
     clean_mode: bool,
+    alt_forwarding_enabled: Arc<Mutex<bool>>,
 }
 
 impl LeChatPHPClient {
@@ -415,6 +422,7 @@ impl LeChatPHPClient {
         let allowlist = Arc::clone(&self.allowlist);
         let alt_account = self.alt_account.clone();
         let master_account = self.master_account.clone();
+        let alt_forwarding_enabled = Arc::clone(&self.alt_forwarding_enabled);
         thread::spawn(move || loop {
             let (_stream, stream_handle) = OutputStream::try_default().unwrap();
             let source = Decoder::new_mp3(Cursor::new(SOUND1)).unwrap();
@@ -441,6 +449,7 @@ impl LeChatPHPClient {
                 &allowlist,
                 alt_account.as_deref(),
                 master_account.as_deref(),
+                &alt_forwarding_enabled,
             ) {
                 log::error!("{}", err);
             };
@@ -639,6 +648,15 @@ impl LeChatPHPClient {
             cfg.bad_exact_usernames = self.bad_exact_username_filters.lock().unwrap().clone();
             cfg.bad_messages = self.bad_message_filters.lock().unwrap().clone();
             cfg.allowlist = self.allowlist.lock().unwrap().clone();
+            if let Err(e) = confy::store("bhcli", None, cfg) {
+                log::error!("failed to store config: {}", e);
+            }
+        }
+    }
+
+    fn save_alt_forwarding_config(&self) {
+        if let Ok(mut cfg) = confy::load::<MyConfig>("bhcli", None) {
+            cfg.alt_forwarding_enabled = *self.alt_forwarding_enabled.lock().unwrap();
             if let Err(e) = confy::store("bhcli", None, cfg) {
                 log::error!("failed to store config: {}", e);
             }
@@ -867,6 +885,18 @@ impl LeChatPHPClient {
             } else {
                 return false;
             }
+        } else if input == "/alt on" {
+            *self.alt_forwarding_enabled.lock().unwrap() = true;
+            self.save_alt_forwarding_config();
+            let msg = "ALT message forwarding enabled".to_string();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
+        } else if input == "/alt off" {
+            *self.alt_forwarding_enabled.lock().unwrap() = false;
+            self.save_alt_forwarding_config();
+            let msg = "ALT message forwarding disabled".to_string();
+            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                .unwrap();
         } else if input.starts_with("/allow ") {
             let user = remove_prefix(input, "/allow ").to_owned();
             {
@@ -2470,6 +2500,7 @@ fn get_msgs(
     allowlist: &Arc<Mutex<Vec<String>>>,
     alt_account: Option<&str>,
     master_account: Option<&str>,
+    alt_forwarding_enabled: &Arc<Mutex<bool>>,
 ) -> anyhow::Result<()> {
     let url = format!(
         "{}/{}?action=view&session={}&lang={}",
@@ -2520,6 +2551,7 @@ fn get_msgs(
             bad_messages,
             allowlist,
             alt_account,
+            alt_forwarding_enabled,
         );
         // Build messages vector. Tag deleted messages.
         update_messages(
@@ -2558,6 +2590,7 @@ fn process_new_messages(
     bad_messages: &Arc<Mutex<Vec<String>>>,
     allowlist: &Arc<Mutex<Vec<String>>>,
     alt_account: Option<&str>,
+    alt_forwarding_enabled: &Arc<Mutex<bool>>,
 ) {
     if let Some(last_known_msg) = messages.first() {
         let last_known_msg_parsed_dt = parse_date(&last_known_msg.date, datetime_fmt);
@@ -2611,31 +2644,33 @@ fn process_new_messages(
                 }
 
                 if let Some(alt) = alt_account {
-                    let text = new_msg.text.text();
-                    if (text.starts_with(members_tag) || text.starts_with(staffs_tag))
-                        && from != alt
-                    {
-                        let _ = tx.send(PostType::Post(text.clone(), Some(alt.to_owned())));
-                    }
-                    if from == alt && to_opt.as_deref() == Some(username) {
-                        if let Some(stripped) = msg.strip_prefix("/m ") {
-                            let _ = tx.send(PostType::Post(
-                                stripped.to_owned(),
-                                Some(SEND_TO_MEMBERS.to_owned()),
-                            ));
-                            // Echo the message back to the alt so it can confirm
-                            let confirm = format!("{}{} - {}", members_tag, username, stripped);
-                            let _ = tx.send(PostType::Post(confirm, Some(alt.to_owned())));
-                        } else if let Some(stripped) = msg.strip_prefix("/s ") {
-                            let _ = tx.send(PostType::Post(
-                                stripped.to_owned(),
-                                Some(SEND_TO_STAFFS.to_owned()),
+                    if *alt_forwarding_enabled.lock().unwrap() {
+                        let text = new_msg.text.text();
+                        if (text.starts_with(members_tag) || text.starts_with(staffs_tag))
+                            && from != alt
+                        {
+                            let _ = tx.send(PostType::Post(text.clone(), Some(alt.to_owned())));
+                        }
+                        if from == alt && to_opt.as_deref() == Some(username) {
+                            if let Some(stripped) = msg.strip_prefix("/m ") {
+                                let _ = tx.send(PostType::Post(
+                                    stripped.to_owned(),
+                                    Some(SEND_TO_MEMBERS.to_owned()),
+                                ));
+                                // Echo the message back to the alt so it can confirm
+                                let confirm = format!("{}{} - {}", members_tag, username, stripped);
+                                let _ = tx.send(PostType::Post(confirm, Some(alt.to_owned())));
+                            } else if let Some(stripped) = msg.strip_prefix("/s ") {
+                                let _ = tx.send(PostType::Post(
+                                    stripped.to_owned(),
+                                    Some(SEND_TO_STAFFS.to_owned()),
                             ));
                             let confirm = format!("{}{} - {}", staffs_tag, username, stripped);
                             let _ = tx.send(PostType::Post(confirm, Some(alt.to_owned())));
                         }
                     }
                 }
+            }
 
                 let is_guest = users.guests.iter().any(|(_, n)| n == &from);
                 if from != username && is_guest {
@@ -2861,6 +2896,14 @@ fn new_default_le_chat_php_client(params: Params) -> LeChatPHPClient {
     let (color_tx, color_rx) = crossbeam_channel::unbounded();
     let (tx, rx) = crossbeam_channel::unbounded();
     let session = params.session.clone();
+    
+    // Load alt forwarding setting from config
+    let alt_forwarding_enabled = if let Ok(cfg) = confy::load::<MyConfig>("bhcli", None) {
+        cfg.alt_forwarding_enabled
+    } else {
+        true // Default to enabled
+    };
+    
     // println!("session[2050] : {:?}",params.session);
     LeChatPHPClient {
         base_client: BaseClient {
@@ -2897,6 +2940,7 @@ fn new_default_le_chat_php_client(params: Params) -> LeChatPHPClient {
         display_staff_view: false,
         display_master_pm_view: false,
         clean_mode: false,
+        alt_forwarding_enabled: Arc::new(Mutex::new(alt_forwarding_enabled)),
     }
 }
 
