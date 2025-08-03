@@ -16,6 +16,7 @@ Pre-buit binaries can be found on the [official website](http://git.dkforestseea
 
 ## Features
 
+- **ChatOps Integration**: 30+ developer-focused slash commands for documentation lookup, development tools, GitHub integration, network diagnostics, and AI assistance
 - Sound notifications when tagged/pmmed
 - Private messages `/pm username message`
 - Kick someone `/kick username message` | `/k username message` (Members +)
@@ -60,11 +61,163 @@ Pre-buit binaries can be found on the [official website](http://git.dkforestseea
 - Custom personal command creation for members+ [ read Command Creation ]
 - Set alternate and master accounts per profile using `/set alt <username>` and `/set master <username>`
 
+## ChatOps Commands
+
+BHCLI includes a comprehensive ChatOps system with 30+ developer-focused commands across multiple categories. These commands provide quick access to documentation, development tools, network diagnostics, and integrations.
+
+### 📖 Documentation & Lookup Commands
+
+Get instant access to documentation and references:
+
+- `/help` - Show all available ChatOps commands with descriptions
+- `/man <command>` - Display manual pages for system commands (e.g., `/man curl`)
+- `/doc <language> <term>` - Language-specific documentation lookup (e.g., `/doc rust HashMap`)
+- `/explain <concept>` - AI-powered explanations of programming concepts
+- `/cheat <tool>` - Quick reference cheatsheets for common tools
+- `/stackoverflow <query>` - Search Stack Overflow for programming questions
+- `/ref <language>` - Quick access to language reference documentation
+
+### 🔧 Tooling & Utilities Commands
+
+Essential development utilities and tools:
+
+- `/hash <algorithm> <text>` - Generate cryptographic hashes (MD5, SHA1, SHA256, SHA512)
+  - Example: `/hash sha256 hello world`
+- `/uuid` - Generate a new UUID v4
+- `/base64 <encode|decode> <text>` - Base64 encoding and decoding
+  - Example: `/base64 encode "hello world"`
+- `/regex <pattern> <text>` - Test regular expressions and see matches
+  - Example: `/regex "\d+" "abc 123 def"`
+- `/whois <domain>` - Domain WHOIS lookup for registration information
+- `/dig <domain>` - DNS record lookup and resolution
+- `/ipinfo <ip>` - Get detailed information about IP addresses
+- `/rand <min> <max>` - Generate random numbers within range
+- `/time` - Display current timestamp and timezone information
+
+### 💬 Chat Linking & Session Intelligence
+
+Enhanced chat functionality and user management:
+
+- `/chatlink <message_id>` - Create shareable links to specific chat messages
+- `/quote <user> <message>` - Quote and reference messages from other users
+- `/rooms` - List all available chat rooms and their status
+- `/whereis <user>` - Find which rooms a user is currently in
+
+### 🤖 AI Integration Commands
+
+Leverage AI for development assistance:
+
+- `/summarize <text>` - AI-powered text summarization
+- `/translate <language> <text>` - Translate text between languages
+- `/fix <code>` - Get AI suggestions for fixing code issues
+- `/review <code>` - AI-powered code quality review and suggestions
+
+### 🐙 GitHub & Package Management
+
+Repository and package information at your fingertips:
+
+#### GitHub Integration
+- `/github <user/repo>` (alias: `/gh`) - Get repository information and links
+  - `/github user/repo` - Show basic repository info
+  - `/github user/repo issues` - Direct link to issues
+  - `/github user/repo latest` - Link to latest release
+  - `/github user/repo file <path>` - Link to specific file
+- `/gist <code>` - Create GitHub Gists (requires GitHub CLI authentication)
+
+#### Package Managers
+- `/crates <crate_name>` - Rust crate information from crates.io
+- `/npm <package_name>` - NPM package information and installation commands
+- `/pip <package_name>` (alias: `/pypi`) - Python package info from PyPI
+
+### 🌐 Network Diagnostics
+
+Network troubleshooting and connectivity tools:
+
+- `/ping <host>` - Test network connectivity and response times
+- `/traceroute <host>` - Trace network path to destination
+- `/nslookup <domain>` - DNS name resolution and record lookup
+- `/netstat` - Display active network connections and listening ports
+
+### ⚙️ Miscellaneous Commands
+
+Additional utility commands:
+
+- `/alias <name> <command>` - Create personal command aliases
+  - `/alias list` - Show all your aliases
+  - `/alias remove <name>` - Remove an alias
+- `/version` - Display BHCLI version and system information
+
+### Command Usage Examples
+
+```bash
+# Documentation lookups
+/help                           # Show all commands
+/man grep                       # Manual page for grep
+/doc rust Vec                   # Rust documentation for Vec
+
+# Development tools  
+/hash sha256 "my secret"        # Generate SHA256 hash
+/uuid                           # Generate new UUID
+/base64 encode "hello world"    # Base64 encode text
+/regex "\d+" "abc 123 def"      # Test regex pattern
+
+# GitHub integration
+/github rust-lang/rust          # Get Rust repository info
+/github microsoft/vscode issues # Link to VS Code issues
+/crates serde                   # Info about serde crate
+/npm express                    # Info about Express.js package
+
+# Network diagnostics
+/ping google.com                # Ping Google
+/dig example.com                # DNS lookup
+/whois github.com               # Domain registration info
+
+# AI assistance
+/translate spanish "Hello world" # Translate to Spanish
+/summarize "long text here..."    # Summarize text
+/fix "broken code here"           # Get code fix suggestions
+```
+
+### Command Permissions
+
+ChatOps commands respect user roles and permissions:
+
+- **Guest**: Access to documentation, basic tools, and read-only commands
+- **Member**: Full access to all ChatOps commands
+- **Staff/Admin**: Complete access plus any future administrative commands
+
+### Command Help System
+
+Each command includes built-in help:
+- Use `/help` to see all available commands
+- Use `/help <command>` to get detailed usage information for specific commands
+- Commands show usage hints when used incorrectly
+
+### Extending ChatOps
+
+The ChatOps system is built with extensibility in mind. New commands can be easily added by implementing the `ChatCommand` trait. The modular architecture supports:
+
+- Custom command categories
+- Alias support for commands
+- Role-based permission checking
+- Structured result formatting
+- Error handling and user feedback
+
 ### Editing mode
 - `ctrl+A` Move cursor to start of line
 - `ctrl+E` Move cursor to end of line
 - `ctrl+F` Move cursor a word forward
 - `ctrl+B` Move cursor a word backward
+- `ctrl+.`, `ctrl+X`, or `ctrl+O` Open external editor (nvim/vim/nano) - automatically sends message after editing
+- `ctrl+L` Toggle multiline input mode (in multiline mode, use `ctrl+Enter` to send, `Enter` for newline)
+- `Up/Down arrows` Navigate through command history (filters by current input prefix)
+
+### Multiline Input Mode
+- `Enter` Insert newline
+- `ctrl+Enter` Send message
+- `ctrl+L` Toggle back to single-line mode
+- `Up/Down arrows` Navigate through command history
+- `Escape` Exit to normal mode
 
 ### Messages navigation
 - Page down the messages list `ctrl+D` | `page down`

@@ -2,8 +2,10 @@ mod bhc;
 mod harm;
 mod lechatphp;
 mod util;
+mod chatops;
 
 use crate::lechatphp::LoginErr;
+use crate::chatops::{ChatOpsRouter, UserRole};
 use anyhow::{anyhow, Context};
 use async_openai::{
     config::OpenAIConfig,
@@ -27,7 +29,7 @@ use crossterm::event::{MouseEvent, MouseEventKind};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, Clear, ClearType},
 };
 use harm::{action_from_score, score_message, Action};
 use lazy_static::lazy_static;
@@ -63,7 +65,7 @@ use tui::{
     layout::{Constraint, Direction, Layout},
     style::{Modifier, Style},
     text::{Span, Spans, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
 use unicode_width::UnicodeWidthStr;
@@ -188,7 +190,7 @@ struct Opts {
     manual_captcha: bool,
     #[arg(short, long, env = "BHC_GUEST_COLOR")]
     guest_color: Option<String>,
-    #[arg(short, long, env = "BHC_REFRESH_RATE", default_value = "5")]
+    #[arg(short, long, env = "BHC_REFRESH_RATE", default_value = "1")]
     refresh_rate: u64,
     #[arg(long, env = "BHC_MAX_LOGIN_RETRY", default_value = "5")]
     max_login_retry: isize,
@@ -310,6 +312,9 @@ struct LeChatPHPClient {
     mod_logs_enabled: Arc<Mutex<bool>>,
     openai_client: Option<async_openai::Client<async_openai::config::OpenAIConfig>>,
     ai_conversation_memory: Arc<Mutex<std::collections::HashMap<String, Vec<(String, String)>>>>, // user -> (role, message) history
+    
+    // ChatOps system
+    chatops_router: ChatOpsRouter,
 }
 
 impl LeChatPHPClient {
@@ -480,55 +485,57 @@ impl LeChatPHPClient {
         let moderation_strictness = self.moderation_strictness.clone();
         let mod_logs_enabled = Arc::clone(&self.mod_logs_enabled);
         let ai_conversation_memory = Arc::clone(&self.ai_conversation_memory);
-        thread::spawn(move || loop {
+        thread::spawn(move || {
             let (_stream, stream_handle) = OutputStream::try_default().unwrap();
-            let source = Decoder::new_mp3(Cursor::new(SOUND1)).unwrap();
-            let mut should_notify = false;
+            loop {
+                let mut should_notify = false;
 
-            if let Err(err) = get_msgs(
-                &client,
-                &base_url,
-                &page_php,
-                &session,
-                &username,
-                &users,
-                &sig,
-                &messages_updated_tx,
-                &members_tag,
-                &staffs_tag,
-                &datetime_fmt,
-                &messages,
-                &mut should_notify,
-                &tx,
-                &bad_usernames,
-                &bad_exact_usernames,
-                &bad_messages,
-                &allowlist,
-                alt_account.as_deref(),
-                master_account.as_deref(),
-                &alt_forwarding_enabled,
-                &ai_enabled,
-                &ai_mode,
-                &openai_client,
-                &system_intel,
-                &moderation_strictness,
-                &mod_logs_enabled,
-                &ai_conversation_memory,
-            ) {
-                log::error!("{}", err);
-            };
-
-            let muted = { *is_muted.lock().unwrap() };
-            if should_notify && !muted {
-                if let Err(err) = stream_handle.play_raw(source.convert_samples()) {
+                if let Err(err) = get_msgs(
+                    &client,
+                    &base_url,
+                    &page_php,
+                    &session,
+                    &username,
+                    &users,
+                    &sig,
+                    &messages_updated_tx,
+                    &members_tag,
+                    &staffs_tag,
+                    &datetime_fmt,
+                    &messages,
+                    &mut should_notify,
+                    &tx,
+                    &bad_usernames,
+                    &bad_exact_usernames,
+                    &bad_messages,
+                    &allowlist,
+                    alt_account.as_deref(),
+                    master_account.as_deref(),
+                    &alt_forwarding_enabled,
+                    &ai_enabled,
+                    &ai_mode,
+                    &openai_client,
+                    &system_intel,
+                    &moderation_strictness,
+                    &mod_logs_enabled,
+                    &ai_conversation_memory,
+                ) {
                     log::error!("{}", err);
-                }
-            }
+                };
 
-            let timeout = after(Duration::from_secs(refresh_rate));
-            select! {
-                recv(&exit_rx) -> _ => return,
-                recv(&timeout) -> _ => {},
+                let muted = { *is_muted.lock().unwrap() };
+                if should_notify && !muted {
+                    let source = Decoder::new_mp3(Cursor::new(SOUND1)).unwrap();
+                    if let Err(err) = stream_handle.play_raw(source.convert_samples()) {
+                        log::error!("{}", err);
+                    }
+                }
+
+                let timeout = after(Duration::from_secs(refresh_rate));
+                select! {
+                    recv(&exit_rx) -> _ => return,
+                    recv(&timeout) -> _ => {},
+                }
             }
         })
     }
@@ -827,7 +834,45 @@ impl LeChatPHPClient {
         }
     }
 
+    /// Determine user role based on current client state
+    fn determine_user_role(&self) -> UserRole {
+        // This is a simplified role determination - in a real implementation,
+        // you'd check the user's actual permissions from the server
+        if self.master_account.is_some() {
+            UserRole::Admin
+        } else if self.alt_account.is_some() {
+            UserRole::Staff
+        } else if !self.display_guest_view {
+            UserRole::Member
+        } else {
+            UserRole::Guest
+        }
+    }
+
     fn process_command(&mut self, input: &str, app: &mut App, users: &Arc<Mutex<Users>>) -> bool {
+        self.process_command_with_target(input, app, users, None)
+    }
+
+    fn process_command_with_target(&mut self, input: &str, app: &mut App, users: &Arc<Mutex<Users>>, target: Option<String>) -> bool {
+        // First, try ChatOps commands
+        let user_role = self.determine_user_role();
+        if let Some(chatops_result) = self.chatops_router.process_command(input, &self.base_client.username, user_role) {
+            // Convert ChatOps result to chat messages
+            let messages = chatops_result.to_messages();
+            for message in messages {
+                // Special case: /help command should always go to @0 (user 0)
+                let message_target = if input.trim() == "/help" {
+                    Some("0".to_owned())
+                } else {
+                    // Use the provided target, or None for main chat
+                    target.clone()
+                };
+                self.post_msg(PostType::Post(message, message_target)).unwrap();
+            }
+            return true;
+        }
+        
+        // Continue with existing commands
         if input == "/dl" {
             self.post_msg(PostType::DeleteLast).unwrap();
         } else if let Some(captures) = DLX_RGX.captures(input) {
@@ -1207,6 +1252,34 @@ impl LeChatPHPClient {
 Chat Commands:
 /pm <user> <message>     - Send private message to user
 /m <message>             - Send message to members only
+/s <message>             - Send message to staff only
+
+ChatOps Developer Commands (30+ tools available):
+/man <command>           - Manual pages for system commands
+/doc <lang> <term>       - Language-specific documentation
+/github <user/repo>      - GitHub repository information
+/crates <crate>          - Rust crate information from crates.io
+/npm <package>           - NPM package information
+/hash <algo> <text>      - Generate cryptographic hashes
+/uuid                    - Generate UUID v4
+/base64 <encode|decode>  - Base64 encoding/decoding
+/regex <pattern> <text>  - Test regular expressions
+/whois <domain>          - Domain WHOIS lookup
+/dig <domain>            - DNS record lookup
+/ping <host>             - Test network connectivity
+/time                    - Current timestamp info
+/explain <concept>       - AI explanations of concepts
+/translate <lang> <text> - Translate text between languages
+... and 15+ more tools
+
+Use '/commands' to see all ChatOps commands for your role.
+Use '/help <command>' for detailed help on ChatOps commands.
+
+ChatOps Command Prefixes:
+/pm <user> /command      - Send ChatOps result as PM to user
+/m /command              - Send ChatOps result to members channel
+/s /command              - Send ChatOps result to staff channel
+(no prefix)              - Send ChatOps result to main chat
 
 AI Commands:
 /ai off                  - Completely disable AI (no moderation, no replies)
@@ -1263,6 +1336,18 @@ Note: Some commands require appropriate permissions."#;
             
             self.post_msg(PostType::Post(help_text.to_string(), Some("0".to_owned())))
                 .unwrap();
+        } else if input == "/commands" {
+            // List all ChatOps commands available to user
+            let user_role = self.determine_user_role();
+            if let Some(chatops_result) = self.chatops_router.process_command("/list", &self.base_client.username, user_role) {
+                let messages = chatops_result.to_messages();
+                for message in messages {
+                    self.post_msg(PostType::Post(message, Some("0".to_owned()))).unwrap();
+                }
+            } else {
+                let msg = "ChatOps commands not available.".to_string();
+                self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+            }
         } else if input == "/status" {
             let ai_enabled = *self.ai_enabled.lock().unwrap();
             let ai_mode = self.ai_mode.lock().unwrap().clone();
@@ -1412,6 +1497,9 @@ Connection:
             InputMode::Normal => self.handle_normal_mode_key_event(app, key_event, messages),
             InputMode::Editing | InputMode::EditingErr => {
                 self.handle_editing_mode_key_event(app, key_event, users)
+            }
+            InputMode::MultilineEditing => {
+                self.handle_multiline_editing_mode_key_event(app, key_event, users)
             }
         }
     }
@@ -1743,6 +1831,26 @@ Connection:
                 ..
             } => self.handle_editing_mode_key_event_ctrl_v(app),
             KeyEvent {
+                code: KeyCode::Char('.'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.handle_editing_mode_key_event_external_editor(app, users)?,
+            KeyEvent {
+                code: KeyCode::Char('x'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.handle_editing_mode_key_event_external_editor(app, users)?,
+            KeyEvent {
+                code: KeyCode::Char('o'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.handle_editing_mode_key_event_external_editor(app, users)?,
+            KeyEvent {
+                code: KeyCode::Char('l'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.handle_editing_mode_key_event_toggle_multiline(app),
+            KeyEvent {
                 code: KeyCode::Left,
                 modifiers: KeyModifiers::NONE,
                 ..
@@ -1757,6 +1865,11 @@ Connection:
                 modifiers: KeyModifiers::NONE,
                 ..
             } => self.handle_editing_mode_key_event_down(app),
+            KeyEvent {
+                code: KeyCode::Up,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.handle_editing_mode_key_event_up(app),
             KeyEvent {
                 code: KeyCode::Char(c),
                 modifiers: KeyModifiers::NONE,
@@ -2349,6 +2462,11 @@ Connection:
         input = replace_newline_escape(&input);
         app.input_idx = 0;
 
+        // Add to history if not empty
+        if !input.trim().is_empty() {
+            app.add_to_history(input.clone());
+        }
+
         // Iterate over commands and execute associated actions
         for (command, action) in &app.commands.commands {
             // log::error!("command :{} action :{}", command, action);
@@ -2363,17 +2481,50 @@ Connection:
 
         let mut cmd_input = input.clone();
         let mut members_prefix = false;
-        if cmd_input.starts_with("/m ") {
+        let mut staffs_prefix = false;
+        let mut pm_target: Option<String> = None;
+        
+        // Check for /pm prefix first
+        if let Some(captures) = PM_RGX.captures(&cmd_input) {
+            let username = captures[1].to_string();
+            let remaining = captures[2].to_string();
+            if remaining.starts_with('/') {
+                // This is a ChatOps command with PM target
+                pm_target = Some(username);
+                cmd_input = remaining;
+            }
+        } else if cmd_input.starts_with("/m ") {
             members_prefix = true;
             if remove_prefix(&cmd_input, "/m ").starts_with('/') {
                 cmd_input = remove_prefix(&cmd_input, "/m ").to_owned();
             }
+        } else if cmd_input.starts_with("/s ") {
+            staffs_prefix = true;
+            if remove_prefix(&cmd_input, "/s ").starts_with('/') {
+                cmd_input = remove_prefix(&cmd_input, "/s ").to_owned();
+            }
         }
 
-        if self.process_command(&cmd_input, app, users) {
+        // Determine target for ChatOps commands
+        let chatops_target = if let Some(user) = pm_target.clone() {
+            Some(user)
+        } else if members_prefix {
+            Some(SEND_TO_MEMBERS.to_owned())
+        } else if staffs_prefix {
+            Some(SEND_TO_STAFFS.to_owned())
+        } else {
+            None
+        };
+
+        if self.process_command_with_target(&cmd_input, app, users, chatops_target) {
             if members_prefix {
                 app.input = "/m ".to_owned();
                 app.input_idx = app.input.width();
+            } else if staffs_prefix {
+                app.input = "/s ".to_owned();
+                app.input_idx = app.input.width();
+            } else if pm_target.is_some() {
+                // Don't reset input for PM - let user continue the conversation
             }
             return Ok(());
         }
@@ -2383,6 +2534,23 @@ Connection:
             let to = Some(SEND_TO_MEMBERS.to_owned());
             self.post_msg(PostType::Post(msg, to)).unwrap();
             app.input = "/m ".to_owned();
+            app.input_idx = app.input.width();
+        } else if staffs_prefix {
+            let msg = remove_prefix(&input, "/s ").to_owned();
+            let to = Some(SEND_TO_STAFFS.to_owned());
+            self.post_msg(PostType::Post(msg, to)).unwrap();
+            app.input = "/s ".to_owned();
+            app.input_idx = app.input.width();
+        } else if let Some(user) = pm_target {
+            // Handle PM that wasn't a ChatOps command
+            let msg = if let Some(captures) = PM_RGX.captures(&input) {
+                captures[2].to_string()
+            } else {
+                input.clone()
+            };
+            let to = Some(user.clone());
+            self.post_msg(PostType::Post(msg, to)).unwrap();
+            app.input = format!("/pm {} ", user);
             app.input_idx = app.input.width();
         } else if input.starts_with("/a ") {
             let msg = remove_prefix(&input, "/a ").to_owned();
@@ -2403,6 +2571,8 @@ Connection:
                 app.input_mode = InputMode::EditingErr;
             } else {
                 self.post_msg(PostType::Post(input, None)).unwrap();
+                // Reset input mode to Normal after sending message
+                app.input_mode = InputMode::Normal;
             }
         }
         Ok(())
@@ -2495,6 +2665,190 @@ Connection:
         }
     }
 
+    fn handle_editing_mode_key_event_external_editor(&mut self, app: &mut App, users: &Arc<Mutex<Users>>) -> Result<(), ExitSignal> {
+        use std::fs;
+        use std::process::{Command, Stdio};
+        use tempfile::NamedTempFile;
+        use std::io::{stdout, Write};
+        
+        // Create a temporary file
+        let mut temp_file = match NamedTempFile::new() {
+            Ok(file) => file,
+            Err(e) => {
+                log::error!("Failed to create temp file: {}", e);
+                return Ok(());
+            }
+        };
+        
+        // Write current input content to the temp file
+        if !app.input.is_empty() {
+            if let Err(e) = temp_file.write_all(app.input.as_bytes()) {
+                log::error!("Failed to write to temp file: {}", e);
+                return Ok(());
+            }
+            if let Err(e) = temp_file.flush() {
+                log::error!("Failed to flush temp file: {}", e);
+                return Ok(());
+            }
+        }
+        
+        // Get the temp file path
+        let temp_path = match temp_file.path().to_str() {
+            Some(path) => path.to_string(),
+            None => {
+                log::error!("Failed to get temp file path");
+                return Ok(());
+            }
+        };
+        
+        // Save the current input to restore if editor fails
+        let original_input = app.input.clone();
+        let original_input_idx = app.input_idx;
+        
+        // Clear input to show editor is active
+        app.input.clear();
+        app.input_idx = 0;
+        
+        // Properly shut down the terminal UI
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout(), LeaveAlternateScreen, Clear(ClearType::All));
+        let _ = stdout().flush();
+        
+        // Determine which editor to use
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
+            for editor in &["nvim", "vim", "nano", "vi"] {
+                if Command::new(editor).arg("--version").output().is_ok() {
+                    return editor.to_string();
+                }
+            }
+            "vi".to_string()
+        });
+        
+        // Launch the editor with proper stdio inheritance
+        let status = Command::new(&editor)
+            .arg(&temp_path)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status();
+        
+        // Immediately restore terminal UI regardless of editor result
+        let _ = enable_raw_mode();
+        let _ = execute!(stdout(), EnterAlternateScreen, Clear(ClearType::All));
+        let _ = stdout().flush();
+        
+        match status {
+            Ok(exit_status) if exit_status.success() => {
+                // Read and process the edited content
+                match fs::read_to_string(&temp_path) {
+                    Ok(content) => {
+                        let content = content.trim_end().to_string();
+                        
+                        if !content.is_empty() {
+                            // Add to history if not empty
+                            app.add_to_history(content.clone());
+                            
+                            // Process and send the message directly, similar to handle_editing_mode_key_event_enter
+                            let mut processed_content = replace_newline_escape(&content);
+                            
+                            // Check for commands and execute them
+                            for (command, action) in &app.commands.commands {
+                                let expected_input = format!("!{}", command);
+                                if processed_content == expected_input {
+                                    if let Err(e) = self.post_msg(PostType::Post(action.clone(), None)) {
+                                        log::error!("Failed to send command from editor: {}", e);
+                                    }
+                                    return Ok(());
+                                }
+                            }
+                            
+                            // Handle member/admin/staff prefixes
+                            let mut members_prefix = false;
+                            if processed_content.starts_with("/m ") {
+                                members_prefix = true;
+                                if remove_prefix(&processed_content, "/m ").starts_with('/') {
+                                    processed_content = remove_prefix(&processed_content, "/m ").to_owned();
+                                }
+                            }
+                            
+                            // Process commands
+                            if self.process_command(&processed_content, app, users) {
+                                if members_prefix {
+                                    app.input = "/m ".to_owned();
+                                    app.input_idx = app.input.width();
+                                }
+                                return Ok(());
+                            }
+                            
+                            // Send the message
+                            if members_prefix {
+                                let msg = remove_prefix(&content, "/m ").to_owned();
+                                if let Err(e) = self.post_msg(PostType::Post(msg, Some(SEND_TO_MEMBERS.to_owned()))) {
+                                    log::error!("Failed to send message to members: {}", e);
+                                }
+                                app.input = "/m ".to_owned();
+                                app.input_idx = app.input.width();
+                            } else if processed_content.starts_with("/a ") {
+                                let msg = remove_prefix(&processed_content, "/a ").to_owned();
+                                if let Err(e) = self.post_msg(PostType::Post(msg, Some(SEND_TO_ADMINS.to_owned()))) {
+                                    log::error!("Failed to send message to admins: {}", e);
+                                }
+                                app.input = "/a ".to_owned();
+                                app.input_idx = app.input.width();
+                            } else if processed_content.starts_with("/s ") {
+                                let msg = remove_prefix(&processed_content, "/s ").to_owned();
+                                if let Err(e) = self.post_msg(PostType::Post(msg, Some(SEND_TO_STAFFS.to_owned()))) {
+                                    log::error!("Failed to send message to staffs: {}", e);
+                                }
+                                app.input = "/s ".to_owned();
+                                app.input_idx = app.input.width();
+                            } else {
+                                if processed_content.starts_with("/") && !processed_content.starts_with("/me ") {
+                                    // Invalid command - put it back in input with error state
+                                    app.input = processed_content;
+                                    app.input_idx = app.input.chars().count();
+                                    app.input_mode = InputMode::EditingErr;
+                                } else {
+                                    // Send as regular message
+                                    if let Err(e) = self.post_msg(PostType::Post(processed_content, None)) {
+                                        log::error!("Failed to send message from editor: {}", e);
+                                    }
+                                    app.input.clear();
+                                    app.input_idx = 0;
+                                    app.input_mode = InputMode::Normal;
+                                }
+                            }
+                        } else {
+                            // Empty content - just go back to normal mode
+                            app.input.clear();
+                            app.input_idx = 0;
+                            app.input_mode = InputMode::Normal;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to read edited file: {}", e);
+                        // Restore original input on read error
+                        app.input = original_input;
+                        app.input_idx = original_input_idx;
+                    }
+                }
+            }
+            Ok(_) => {
+                // Editor was cancelled/failed - restore original input
+                app.input = original_input;
+                app.input_idx = original_input_idx;
+            }
+            Err(e) => {
+                log::error!("Failed to launch editor {}: {}", editor, e);
+                // Restore original input on launch error
+                app.input = original_input;
+                app.input_idx = original_input_idx;
+            }
+        }
+        
+        Ok(())
+    }
+
     fn handle_editing_mode_key_event_newline(&mut self, app: &mut App) {
         let byte_position = byte_pos(&app.input, app.input_idx).unwrap();
         app.input.insert(byte_position, '\n');
@@ -2513,12 +2867,8 @@ Connection:
         }
     }
 
-    fn handle_editing_mode_key_event_down(&mut self, app: &mut App) {
-        app.input_mode = InputMode::Normal;
-        app.items.next();
-    }
-
     fn handle_editing_mode_key_event_shift_c(&mut self, app: &mut App, c: char) {
+        app.reset_history_navigation();
         let byte_position = byte_pos(&app.input, app.input_idx).unwrap();
         app.input.insert(byte_position, c);
 
@@ -2527,6 +2877,7 @@ Connection:
     }
 
     fn handle_editing_mode_key_event_backspace(&mut self, app: &mut App) {
+        app.reset_history_navigation();
         if app.input_idx > 0 {
             app.input_idx -= 1;
             app.input = remove_at(&app.input, app.input_idx);
@@ -2535,6 +2886,7 @@ Connection:
     }
 
     fn handle_editing_mode_key_event_delete(&mut self, app: &mut App) {
+        app.reset_history_navigation();
         if app.input_idx > 0 && app.input_idx == app.input.width() {
             app.input_idx -= 1;
         }
@@ -2544,6 +2896,284 @@ Connection:
 
     fn handle_editing_mode_key_event_esc(&mut self, app: &mut App) {
         app.input_mode = InputMode::Normal;
+        app.reset_history_navigation();
+    }
+
+    fn handle_editing_mode_key_event_up(&mut self, app: &mut App) {
+        // In multiline mode, handle cursor navigation first
+        if app.input_mode == InputMode::MultilineEditing {
+            let input = &app.input;
+            let lines: Vec<&str> = input.split('\n').collect();
+            
+            // Calculate which line the cursor is on
+            let mut current_pos = 0;
+            let mut cursor_line = 0;
+            let mut chars_in_line = 0;
+            
+            for (line_idx, line) in lines.iter().enumerate() {
+                let line_len = line.chars().count();
+                if current_pos + line_len >= app.input_idx {
+                    cursor_line = line_idx;
+                    chars_in_line = app.input_idx - current_pos;
+                    break;
+                }
+                current_pos += line_len + 1; // +1 for newline
+            }
+            
+            // Try to move cursor to previous line
+            if cursor_line > 0 {
+                let prev_line = lines[cursor_line - 1];
+                let prev_line_len = prev_line.chars().count();
+                let new_pos_in_line = chars_in_line.min(prev_line_len);
+                
+                // Calculate new cursor position
+                let mut new_cursor_pos = 0;
+                for i in 0..(cursor_line - 1) {
+                    new_cursor_pos += lines[i].chars().count();
+                    if i < cursor_line - 1 {
+                        new_cursor_pos += 1; // for newline
+                    }
+                }
+                if cursor_line > 1 {
+                    new_cursor_pos += 1; // for newline before previous line
+                }
+                new_cursor_pos += new_pos_in_line;
+                
+                app.input_idx = new_cursor_pos;
+            } else {
+                // At first line, try history navigation
+                app.navigate_history_up();
+            }
+        } else {
+            // Regular single-line mode, use history navigation
+            app.navigate_history_up();
+        }
+    }
+
+    fn handle_editing_mode_key_event_down(&mut self, app: &mut App) {
+        app.navigate_history_down();
+    }
+
+    fn handle_editing_mode_key_event_toggle_multiline(&mut self, app: &mut App) {
+        match app.input_mode {
+            InputMode::Editing | InputMode::EditingErr => {
+                app.input_mode = InputMode::MultilineEditing;
+            }
+            InputMode::MultilineEditing => {
+                app.input_mode = InputMode::Editing;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_multiline_editing_mode_key_event(
+        &mut self,
+        app: &mut App,
+        key_event: KeyEvent,
+        users: &Arc<Mutex<Users>>,
+    ) -> Result<(), ExitSignal> {
+        match key_event {
+            // Send message on Ctrl+Enter in multiline mode
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.handle_multiline_editing_mode_key_event_send(app, users)?,
+            // Add newline on Enter in multiline mode
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.handle_editing_mode_key_event_newline(app),
+            // Toggle back to single-line mode OR send if already in multiline
+            KeyEvent {
+                code: KeyCode::Char('l'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.handle_multiline_editing_mode_key_event_ctrl_l(app, users)?,
+            // History navigation
+            KeyEvent {
+                code: KeyCode::Up,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.handle_editing_mode_key_event_up(app),
+            KeyEvent {
+                code: KeyCode::Down,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.handle_multiline_editing_mode_key_event_down(app),
+            // All other editing keys work the same
+            KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.handle_editing_mode_key_event_tab(app, users),
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.handle_multiline_editing_mode_key_event_ctrl_c(app),
+            KeyEvent {
+                code: KeyCode::Char('a'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.handle_editing_mode_key_event_ctrl_a(app),
+            KeyEvent {
+                code: KeyCode::Char('e'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.handle_editing_mode_key_event_ctrl_e(app),
+            KeyEvent {
+                code: KeyCode::Char('f'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.handle_editing_mode_key_event_ctrl_f(app),
+            KeyEvent {
+                code: KeyCode::Char('b'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.handle_editing_mode_key_event_ctrl_b(app),
+            KeyEvent {
+                code: KeyCode::Char('v'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.handle_editing_mode_key_event_ctrl_v(app),
+            KeyEvent {
+                code: KeyCode::Char('.'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.handle_editing_mode_key_event_external_editor(app, users)?,
+            KeyEvent {
+                code: KeyCode::Char('x'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.handle_editing_mode_key_event_external_editor(app, users)?,
+            KeyEvent {
+                code: KeyCode::Char('o'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => self.handle_editing_mode_key_event_external_editor(app, users)?,
+            KeyEvent {
+                code: KeyCode::Left,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.handle_editing_mode_key_event_left(app),
+            KeyEvent {
+                code: KeyCode::Right,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.handle_editing_mode_key_event_right(app),
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => self.handle_multiline_editing_mode_key_event_shift_c(app, c),
+            KeyEvent {
+                code: KeyCode::Backspace,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.handle_editing_mode_key_event_backspace(app),
+            KeyEvent {
+                code: KeyCode::Delete,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.handle_editing_mode_key_event_delete(app),
+            KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.handle_multiline_editing_mode_key_event_esc(app),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_multiline_editing_mode_key_event_send(
+        &mut self,
+        app: &mut App,
+        users: &Arc<Mutex<Users>>,
+    ) -> Result<(), ExitSignal> {
+        // Same logic as regular enter, but add to history first
+        if !app.input.trim().is_empty() {
+            app.add_to_history(app.input.clone());
+        }
+        self.handle_editing_mode_key_event_enter(app, users)
+    }
+
+    fn handle_multiline_editing_mode_key_event_ctrl_l(
+        &mut self,
+        app: &mut App,
+        users: &Arc<Mutex<Users>>,
+    ) -> Result<(), ExitSignal> {
+        // In multiline mode, Ctrl+L sends the message (like Ctrl+Enter)
+        self.handle_multiline_editing_mode_key_event_send(app, users)
+    }
+
+    fn handle_multiline_editing_mode_key_event_down(&mut self, app: &mut App) {
+        // Handle cursor navigation in multiline content
+        let input = &app.input;
+        let lines: Vec<&str> = input.split('\n').collect();
+        
+        // Calculate which line the cursor is on
+        let mut current_pos = 0;
+        let mut cursor_line = 0;
+        let mut chars_in_line = 0;
+        
+        for (line_idx, line) in lines.iter().enumerate() {
+            let line_len = line.chars().count();
+            if current_pos + line_len >= app.input_idx {
+                cursor_line = line_idx;
+                chars_in_line = app.input_idx - current_pos;
+                break;
+            }
+            current_pos += line_len + 1; // +1 for newline
+        }
+        
+        // Try to move cursor to next line
+        if cursor_line + 1 < lines.len() {
+            let next_line = lines[cursor_line + 1];
+            let next_line_len = next_line.chars().count();
+            let new_pos_in_line = chars_in_line.min(next_line_len);
+            
+            // Calculate new cursor position
+            let mut new_cursor_pos = 0;
+            for i in 0..=cursor_line {
+                new_cursor_pos += lines[i].chars().count();
+                if i < cursor_line {
+                    new_cursor_pos += 1; // for newline
+                }
+            }
+            new_cursor_pos += 1; // for the newline between current and next line
+            new_cursor_pos += new_pos_in_line;
+            
+            app.input_idx = new_cursor_pos.min(input.chars().count());
+        } else {
+            // At last line, try history navigation
+            app.navigate_history_down();
+        }
+    }
+
+    fn handle_multiline_editing_mode_key_event_shift_c(&mut self, app: &mut App, c: char) {
+        app.reset_history_navigation();
+        self.handle_editing_mode_key_event_shift_c(app, c);
+    }
+
+    fn handle_multiline_editing_mode_key_event_ctrl_c(&mut self, app: &mut App) {
+        app.reset_history_navigation();
+        app.input_mode = InputMode::Normal;
+        app.clear_filter();
+        app.input = "".to_owned();
+        app.input_idx = 0;
+    }
+
+    fn handle_multiline_editing_mode_key_event_esc(&mut self, app: &mut App) {
+        app.input_mode = InputMode::Normal;
+        app.reset_history_navigation();
     }
 
     fn handle_mouse_event(
@@ -3866,6 +4496,7 @@ fn new_default_le_chat_php_client(params: Params) -> LeChatPHPClient {
         mod_logs_enabled: Arc::new(Mutex::new(mod_logs_enabled)),
         openai_client,
         ai_conversation_memory: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        chatops_router: ChatOpsRouter::new(),
     }
 }
 
@@ -4028,9 +4659,9 @@ fn start_dkf_notifier(client: &Client, dkf_api_key: &str) {
     let client = client.clone();
     let dkf_api_key = dkf_api_key.to_owned();
     let mut last_known_date = Utc::now();
-    thread::spawn(move || loop {
+    thread::spawn(move || {
         let (_stream, stream_handle) = OutputStream::try_default().unwrap();
-        let source = Decoder::new_mp3(Cursor::new(SOUND1)).unwrap();
+        loop {
 
         let params: Vec<(&str, String)> = vec![(
             "last_known_date",
@@ -4046,6 +4677,7 @@ fn start_dkf_notifier(client: &Client, dkf_api_key: &str) {
             if let Ok(txt) = resp.text() {
                 if let Ok(v) = serde_json::from_str::<DkfNotifierResp>(&txt) {
                     if v.pm_sound || v.tagged_sound {
+                        let source = Decoder::new_mp3(Cursor::new(SOUND1)).unwrap();
                         stream_handle.play_raw(source.convert_samples()).unwrap();
                     }
                     last_known_date = DateTime::parse_from_rfc3339(&v.last_message_created_at)
@@ -4055,6 +4687,7 @@ fn start_dkf_notifier(client: &Client, dkf_api_key: &str) {
             }
         }
         thread::sleep(Duration::from_secs(5));
+        }
     });
 }
 
@@ -4065,29 +4698,30 @@ fn start_dnmx_mail_notifier(client: &Client, username: &str, password: &str) {
     client.post(login_url).form(&params).send().unwrap();
 
     let client_clone = client.clone();
-    thread::spawn(move || loop {
+    thread::spawn(move || {
         let (_stream, stream_handle) = OutputStream::try_default().unwrap();
-        let source = Decoder::new_mp3(Cursor::new(SOUND1)).unwrap();
-
-        let right_url = format!("{}/src/right_main.php", DNMX_URL);
-        if let Ok(resp) = client_clone.get(right_url).send() {
-            let mut nb_mails = 0;
-            let doc = Document::from(resp.text().unwrap().as_str());
-            if let Some(table) = doc.find(Name("table")).nth(7) {
-                table.find(Name("tr")).skip(1).for_each(|n| {
-                    if let Some(td) = n.find(Name("td")).nth(2) {
-                        if td.find(Name("b")).nth(0).is_some() {
-                            nb_mails += 1;
+        loop {
+            let right_url = format!("{}/src/right_main.php", DNMX_URL);
+            if let Ok(resp) = client_clone.get(right_url).send() {
+                let mut nb_mails = 0;
+                let doc = Document::from(resp.text().unwrap().as_str());
+                if let Some(table) = doc.find(Name("table")).nth(7) {
+                    table.find(Name("tr")).skip(1).for_each(|n| {
+                        if let Some(td) = n.find(Name("td")).nth(2) {
+                            if td.find(Name("b")).nth(0).is_some() {
+                                nb_mails += 1;
+                            }
                         }
-                    }
-                });
+                    });
+                }
+                if nb_mails > 0 {
+                    log::error!("{} new mails", nb_mails);
+                    let source = Decoder::new_mp3(Cursor::new(SOUND1)).unwrap();
+                    stream_handle.play_raw(source.convert_samples()).unwrap();
+                }
             }
-            if nb_mails > 0 {
-                log::error!("{} new mails", nb_mails);
-                stream_handle.play_raw(source.convert_samples()).unwrap();
-            }
+            thread::sleep(Duration::from_secs(60));
         }
-        thread::sleep(Duration::from_secs(60));
     });
 }
 
@@ -4640,12 +5274,18 @@ fn draw_terminal_frame(
             .split(f.size());
 
         {
+            // Determine textbox height based on input mode
+            let textbox_height = match app.input_mode {
+                InputMode::MultilineEditing => 8, // Larger height for multiline mode
+                _ => 3, // Default height for single-line modes
+            };
+
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints(
                     [
                         Constraint::Length(1),
-                        Constraint::Length(3),
+                        Constraint::Length(textbox_height),
                         Constraint::Min(1),
                     ]
                     .as_ref(),
@@ -4797,6 +5437,16 @@ fn render_help_txt(
             Style::default(),
         ),
         InputMode::LongMessage => (vec![], Style::default()),
+        InputMode::MultilineEditing => (
+            vec![
+                Span::raw("Press "),
+                Span::styled("Ctrl+L", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" to exit multiline mode, "),
+                Span::styled("Ctrl+Enter", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(" to send"),
+            ],
+            Style::default(),
+        ),
     };
     msg.extend(vec![Span::raw(format!(" | {}", curr_user))]);
     if app.is_muted {
@@ -4859,35 +5509,116 @@ fn render_help_txt(
 fn render_textbox(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App, r: Rect) {
     let w = (r.width - 3) as usize;
     let str = app.input.clone();
-    let mut input_str = str.as_str();
-    let mut overflow = 0;
-    if app.input_idx >= w {
-        overflow = std::cmp::max(app.input.width() - w, 0);
-        input_str = &str[overflow..];
-    }
-    let input = Paragraph::new(input_str)
-        .style(match app.input_mode {
-            InputMode::LongMessage => Style::default(),
-            InputMode::Normal => Style::default(),
-            InputMode::Editing => Style::default().fg(tuiColor::Yellow),
-            InputMode::EditingErr => Style::default().fg(tuiColor::Red),
-        })
-        .block(Block::default().borders(Borders::ALL).title("Input"));
-    f.render_widget(input, r);
+    
+    // Handle multiline vs single line display differently
+    let (input_widget, cursor_x, cursor_y) = match app.input_mode {
+        InputMode::MultilineEditing => {
+            // For multiline, we need to properly handle line wrapping and newlines
+            let lines: Vec<&str> = str.split('\n').collect();
+            let text_width = (r.width - 3) as usize; // Account for borders
+            let available_height = (r.height - 2) as usize; // Account for borders
+            
+            // Calculate total visual lines (including wrapped lines)
+            let mut total_visual_lines = 0;
+            let mut line_visual_counts = Vec::new();
+            for line in &lines {
+                let line_len = line.chars().count();
+                let visual_count = if line_len == 0 { 1 } else { (line_len + text_width - 1) / text_width };
+                line_visual_counts.push(visual_count);
+                total_visual_lines += visual_count;
+            }
+            
+            // Calculate which line the cursor is on and position within that line
+            let mut cursor_line = 0;
+            let mut chars_before_cursor = 0;
+            let mut current_pos = 0;
+            let mut cursor_visual_line = 0; // Track visual lines including wrapping
+            
+            for (line_idx, line) in lines.iter().enumerate() {
+                let line_len = line.chars().count();
+                if current_pos + line_len >= app.input_idx {
+                    cursor_line = line_idx;
+                    chars_before_cursor = app.input_idx - current_pos;
+                    
+                    // Calculate how many visual lines this cursor position creates due to wrapping
+                    let chars_in_current_line = chars_before_cursor;
+                    let wrapped_lines_before = chars_in_current_line / text_width;
+                    cursor_visual_line += wrapped_lines_before;
+                    chars_before_cursor = chars_in_current_line % text_width;
+                    break;
+                }
+                current_pos += line_len + 1; // +1 for the newline character
+                cursor_visual_line += line_visual_counts[line_idx];
+            }
+            
+            // Ensure cursor is within bounds
+            if cursor_line < lines.len() {
+                let current_line_len = lines[cursor_line].chars().count();
+                chars_before_cursor = chars_before_cursor.min(current_line_len % text_width);
+            }
+            
+            // Auto-scroll to keep cursor visible
+            if cursor_visual_line < app.multiline_scroll_offset {
+                app.multiline_scroll_offset = cursor_visual_line;
+            } else if cursor_visual_line >= app.multiline_scroll_offset + available_height {
+                app.multiline_scroll_offset = cursor_visual_line - available_height + 1;
+            }
+            
+            // Ensure scroll offset doesn't exceed content
+            if total_visual_lines <= available_height {
+                app.multiline_scroll_offset = 0;
+            } else {
+                app.multiline_scroll_offset = app.multiline_scroll_offset.min(total_visual_lines - available_height);
+            }
+            
+            // Create the paragraph with proper line breaks and scrolling
+            let input = Paragraph::new(str.as_str())
+                .style(Style::default().fg(tuiColor::Cyan))
+                .block(Block::default().borders(Borders::ALL).title("Input (Multiline)"))
+                .wrap(Wrap { trim: false })
+                .scroll((app.multiline_scroll_offset as u16, 0));
+            
+            // Calculate cursor position accounting for wrapping and scrolling
+            let cursor_x = r.x + 1 + chars_before_cursor as u16;
+            let cursor_y = r.y + 1 + (cursor_visual_line - app.multiline_scroll_offset) as u16;
+            
+            (input, cursor_x, cursor_y)
+        }
+        _ => {
+            // Single line handling (existing logic)
+            let mut input_str = str.as_str();
+            let mut overflow = 0;
+            if app.input_idx >= w {
+                overflow = std::cmp::max(app.input.width() - w, 0);
+                input_str = &str[overflow..];
+            }
+            
+            let input = Paragraph::new(input_str)
+                .style(match app.input_mode {
+                    InputMode::LongMessage => Style::default(),
+                    InputMode::Normal => Style::default(),
+                    InputMode::Editing => Style::default().fg(tuiColor::Yellow),
+                    InputMode::EditingErr => Style::default().fg(tuiColor::Red),
+                    InputMode::MultilineEditing => Style::default().fg(tuiColor::Cyan),
+                })
+                .block(Block::default().borders(Borders::ALL).title("Input"));
+            
+            let cursor_x = r.x + app.input_idx as u16 - overflow as u16 + 1;
+            let cursor_y = r.y + 1;
+            
+            (input, cursor_x, cursor_y)
+        }
+    };
+    
+    f.render_widget(input_widget, r);
+    
+    // Set cursor position based on input mode
     match app.input_mode {
         InputMode::LongMessage => {}
-        InputMode::Normal =>
-            // Hide the cursor. `Frame` does this by default, so we don't need to do anything here
-            {}
-
-        InputMode::Editing | InputMode::EditingErr => {
-            // Make the cursor visible and ask tui-rs to put it at the specified coordinates after rendering
-            f.set_cursor(
-                // Put cursor past the end of the input text
-                r.x + app.input_idx as u16 - overflow as u16 + 1,
-                // Move one line down, from the border to the input line
-                r.y + 1,
-            )
+        InputMode::Normal => {}
+        InputMode::Editing | InputMode::EditingErr | InputMode::MultilineEditing => {
+            // Make the cursor visible and position it correctly
+            f.set_cursor(cursor_x, cursor_y);
         }
     }
 }
@@ -5055,6 +5786,7 @@ enum InputMode {
     Normal,
     Editing,
     EditingErr,
+    MultilineEditing,
 }
 
 /// App holds the state of the application
@@ -5064,6 +5796,10 @@ struct App {
     input_idx: usize,
     /// Current input mode
     input_mode: InputMode,
+    /// Command history for up/down arrow navigation
+    command_history: Vec<String>,
+    command_history_index: Option<usize>,
+    temp_input: String, // Stores current input when browsing history
     is_muted: bool,
     show_sys: bool,
     display_guest_view: bool,
@@ -5082,6 +5818,9 @@ struct App {
     display_staff_view: bool,
     display_master_pm_view: bool,
     clean_mode: bool,
+    
+    // Multiline input scrolling
+    multiline_scroll_offset: usize,
 }
 
 impl Default for App {
@@ -5120,6 +5859,9 @@ impl Default for App {
             input: String::new(),
             input_idx: 0,
             input_mode: InputMode::Normal,
+            command_history: Vec::new(),
+            command_history_index: None,
+            temp_input: String::new(),
             is_muted: false,
             show_sys: false,
             display_guest_view: false,
@@ -5137,6 +5879,7 @@ impl Default for App {
             display_staff_view: false,
             display_master_pm_view: false,
             clean_mode: false,
+            multiline_scroll_offset: 0,
         }
     }
 }
@@ -5155,6 +5898,113 @@ impl App {
             self.input = "".to_owned();
             self.input_idx = 0;
         }
+    }
+
+    fn add_to_history(&mut self, command: String) {
+        if !command.is_empty() && !command.trim().is_empty() {
+            // Remove duplicate if it exists
+            if let Some(pos) = self.command_history.iter().position(|x| *x == command) {
+                self.command_history.remove(pos);
+            }
+            // Add to the end (most recent)
+            self.command_history.push(command);
+            // Keep only last 100 commands
+            if self.command_history.len() > 100 {
+                self.command_history.remove(0);
+            }
+        }
+        // Reset history navigation
+        self.command_history_index = None;
+        self.temp_input.clear();
+    }
+
+    fn navigate_history_up(&mut self) {
+        if self.command_history.is_empty() {
+            return;
+        }
+
+        let current_input = self.input.clone();
+        
+        match self.command_history_index {
+            None => {
+                // First time navigating history, save current input
+                self.temp_input = current_input.clone();
+                // Find the most recent command that starts with current input
+                let matching_commands: Vec<(usize, &String)> = self.command_history
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .filter(|(_, cmd)| {
+                        if current_input.is_empty() {
+                            true
+                        } else {
+                            cmd.starts_with(&current_input)
+                        }
+                    })
+                    .collect();
+                
+                if let Some((idx, cmd)) = matching_commands.first() {
+                    self.command_history_index = Some(*idx);
+                    self.input = cmd.to_string();
+                    self.input_idx = self.input.chars().count();
+                }
+            }
+            Some(current_idx) => {
+                // Find next older matching command
+                let matching_commands: Vec<(usize, &String)> = self.command_history
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .filter(|(idx, cmd)| {
+                        *idx < current_idx && (self.temp_input.is_empty() || cmd.starts_with(&self.temp_input))
+                    })
+                    .collect();
+                
+                if let Some((idx, cmd)) = matching_commands.first() {
+                    self.command_history_index = Some(*idx);
+                    self.input = cmd.to_string();
+                    self.input_idx = self.input.chars().count();
+                }
+            }
+        }
+    }
+
+    fn navigate_history_down(&mut self) {
+        if self.command_history.is_empty() {
+            return;
+        }
+
+        match self.command_history_index {
+            None => {
+                // Not currently navigating history, do nothing
+            }
+            Some(current_idx) => {
+                // Find next newer matching command
+                let matching_commands: Vec<(usize, &String)> = self.command_history
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, cmd)| {
+                        *idx > current_idx && (self.temp_input.is_empty() || cmd.starts_with(&self.temp_input))
+                    })
+                    .collect();
+                
+                if let Some((idx, cmd)) = matching_commands.first() {
+                    self.command_history_index = Some(*idx);
+                    self.input = cmd.to_string();
+                    self.input_idx = self.input.chars().count();
+                } else {
+                    // No newer commands, go back to original input
+                    self.command_history_index = None;
+                    self.input = self.temp_input.clone();
+                    self.input_idx = self.input.chars().count();
+                }
+            }
+        }
+    }
+
+    fn reset_history_navigation(&mut self) {
+        self.command_history_index = None;
+        self.temp_input.clear();
     }
 }
 
