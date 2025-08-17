@@ -1,0 +1,37 @@
+# Example identity configuration for bhcli
+# Add this to your profile section in the config file
+
+[profiles.your_profile_name]
+username = "your_username"
+password = "your_password"
+# ... other profile settings ...
+
+# Custom identity configurations
+# Format: command_name = ["nickname", "color", "incognito", "member", "staff"]
+# The last three are optional boolean flags (default: false)
+[profiles.your_profile_name.identities]
+admin = ["Administrator", "#FF0000", "false", "false", "true"]    # Red admin identity
+mod = ["Moderator", "#00FF00", "false", "true", "false"]          # Green moderator identity
+ghost = ["Ghost", "#CCCCCC", "true", "false", "false"]           # Gray ghost identity (incognito)
+dev = ["Developer", "#0099FF", "false", "true", "true"]           # Blue developer identity
+anon = ["Anonymous", "#666666", "true", "false", "false"]        # Dark gray anonymous identity
+
+# Usage examples:
+# /admin hello everyone    - Send as Administrator in red
+# /mod please behave       - Send as Moderator in green
+# /ghost /kick baduser     - Kick as Ghost (incognito)
+# /dev working on updates  - Send as Developer (member + staff privileges)
+# /anon secret message     - Send as Anonymous (incognito)
+
+# Built-in identity commands (john, intel, op, shadow, cyber, viper, phoenix)
+# can also be overridden by adding them to the identities table:
+john = ["JohnCustom", "#FF00FF", "false", "false", "false"]       # Override /john command
+
+# Notes:
+# - The first two values (nickname, color) are required
+# - Color should be a hex color code starting with #
+# - incognito: if "true", hides from guest list
+# - member: if "true", has member privileges 
+# - staff: if "true", has staff privileges
+# - All identity commands support kick functionality: /admin /kick username reason
+# - All identity commands support targeting: /m /admin, /s /mod, /pm user /dev
