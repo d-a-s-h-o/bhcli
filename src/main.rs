@@ -304,7 +304,12 @@ struct LeChatPHPClient {
     display_staff_view: bool,
     display_master_pm_view: bool,
     clean_mode: bool,
+    inbox_mode: bool,
     alt_forwarding_enabled: Arc<Mutex<bool>>,
+    
+    // Store current active identity for restoration
+    current_username: String,
+    current_color: String,
     
     // AI fields
     ai_enabled: Arc<Mutex<bool>>,
@@ -613,6 +618,7 @@ impl LeChatPHPClient {
             app.display_staff_view = self.display_staff_view;
             app.display_master_pm_view = self.display_master_pm_view;
             app.clean_mode = self.clean_mode;
+            app.inbox_mode = self.inbox_mode;
             app.alt_account = self.alt_account.clone();
             app.master_account = self.master_account.clone();
             app.members_tag = self.config.members_tag.clone();
@@ -669,6 +675,41 @@ impl LeChatPHPClient {
 
     fn post_msg(&self, post_type: PostType) -> anyhow::Result<()> {
         self.tx.send(post_type)?;
+        Ok(())
+    }
+
+    fn clear_all_inbox_messages(&self, app: &mut App) -> anyhow::Result<()> {
+        if let Some(session) = &self.session {
+            let url = format!("{}?action=inbox&session={}", &self.config.url, session);
+            
+            // Collect all message IDs
+            let message_ids: Vec<String> = app.inbox_items.items.iter().map(|m| m.id.clone()).collect();
+            
+            if message_ids.is_empty() {
+                return Ok(());
+            }
+            
+            let mut form = reqwest::blocking::multipart::Form::new()
+                .text("lang", "en")
+                .text("action", "inbox")
+                .text("session", session.clone())
+                .text("do", "clean");
+            
+            // Add all message IDs as checkboxes
+            for mid in &message_ids {
+                form = form.text("mid[]", mid.clone());
+            }
+            
+            let response = self.client.post(&url).multipart(form).send()?;
+            
+            if response.status().is_success() {
+                // Clear local inbox
+                app.inbox_items.items.clear();
+                app.inbox_items.state.select(None);
+            } else {
+                return Err(anyhow::anyhow!("Failed to clear inbox: {}", response.status()));
+            }
+        }
         Ok(())
     }
 
@@ -885,16 +926,19 @@ impl LeChatPHPClient {
             
             let nickname = identity_config[0].clone();
             let color = identity_config[1].clone();
-            let _incognito = identity_config.get(2).map(|s| s == "true").unwrap_or(false);
+            // Trim quotes from color if present (for backwards compatibility)
+            let color = color.trim_matches('"').trim_matches('\'');
+            let incognito = identity_config.get(2).map(|s| s == "true").unwrap_or(false);
             let bold = identity_config.get(3).map(|s| s == "true").unwrap_or(false);
             let italic = identity_config.get(4).map(|s| s == "true").unwrap_or(false);
             
-            // Store original user info for restoration
-            let original_username = self.base_client.username.clone();
+            // Store current user info for restoration
+            let current_username = self.current_username.clone();
+            let current_color = self.current_color.clone();
             
             if !message.is_empty() {
                 // First set profile to the configured identity
-                self.post_msg(PostType::Profile(color, nickname, true, bold, italic))
+                self.post_msg(PostType::Profile(color.to_string(), nickname, incognito, bold, italic))
                     .unwrap();
                 
                 // Check if this is a kick command
@@ -909,7 +953,7 @@ impl LeChatPHPClient {
                         
                         // Add another delay before restoring profile
                         thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), original_username, true, true, true));
+                        let _ = tx.send(PostType::Profile(current_color, current_username, true, true, true));
                     });
                 } else {
                     // Handle regular message
@@ -922,7 +966,7 @@ impl LeChatPHPClient {
                         
                         // Add another delay before restoring profile
                         thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), original_username, true, true, true));
+                        let _ = tx.send(PostType::Profile(current_color, current_username, true, true, true));
                     });
                 }
             }
@@ -956,8 +1000,50 @@ impl LeChatPHPClient {
         }
     }
 
-    fn process_command(&mut self, input: &str, app: &mut App, users: &Arc<Mutex<Users>>) -> bool {
-        self.process_command_with_target(input, app, users, None)
+    fn switch_to_identity(&mut self, command: &str) -> Result<(), String> {
+        if let Some(identity_config) = self.identities.get(command) {
+            if identity_config.len() >= 2 {
+                let nickname = identity_config[0].clone();
+                let color = identity_config[1].clone();
+                // Trim quotes from color if present (for backwards compatibility)
+                let color = color.trim_matches('"').trim_matches('\'');
+                let incognito = identity_config.get(2).map(|s| s == "true").unwrap_or(false);
+                let bold = identity_config.get(3).map(|s| s == "true").unwrap_or(false);
+                let italic = identity_config.get(4).map(|s| s == "true").unwrap_or(false);
+                
+                // Update current identity tracking
+                self.current_username = nickname.clone();
+                self.current_color = color.to_string();
+                
+                // Update the base client username for login purposes
+                self.base_client.username = nickname.clone();
+                
+                // Save username to config file for future logins
+                if let Ok(mut cfg) = confy::load::<MyConfig>("bhcli", None) {
+                    if let Some(profile_cfg) = cfg.profiles.get_mut(&self.profile) {
+                        profile_cfg.username = nickname.clone();
+                        if let Err(e) = confy::store("bhcli", None, cfg) {
+                            log::error!("Failed to save username to config: {}", e);
+                        }
+                    }
+                }
+                
+                // Permanently switch to the identity
+                self.post_msg(PostType::Profile(color.to_string(), nickname.clone(), incognito, bold, italic))
+                    .unwrap();
+                
+                // Send confirmation message to @0
+                let confirmation_msg = format!("You are now @{}", nickname);
+                self.post_msg(PostType::Post(confirmation_msg, Some("0".to_owned())))
+                    .unwrap();
+                
+                Ok(())
+            } else {
+                Err(format!("Invalid identity configuration for /{}", command))
+            }
+        } else {
+            Err(format!("Identity /{} not found", command))
+        }
     }
 
     fn process_command_with_target(&mut self, input: &str, app: &mut App, users: &Arc<Mutex<Users>>, target: Option<String>) -> bool {
@@ -1362,6 +1448,25 @@ impl LeChatPHPClient {
             let msg = format!("Cleared all warnings ({} users)", count);
             self.post_msg(PostType::Post(msg, Some("0".to_owned())))
                 .unwrap();
+        } else if input == "/clearinbox" {
+            if self.inbox_mode {
+                match self.clear_all_inbox_messages(app) {
+                    Ok(()) => {
+                        let msg = "All inbox messages cleared".to_string();
+                        self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                            .unwrap();
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to clear inbox: {}", e);
+                        self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                            .unwrap();
+                    }
+                }
+            } else {
+                let msg = "Command only available in inbox mode (Shift+O)".to_string();
+                self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                    .unwrap();
+            }
         } else if let Some(captures) = IGNORE_RGX.captures(input) {
             let username = captures[1].to_owned();
             self.post_msg(PostType::Ignore(username)).unwrap();
@@ -1386,325 +1491,6 @@ impl LeChatPHPClient {
             };
             self.post_msg(PostType::Upload(file_path, send_to, msg))
                 .unwrap();
-        } else if input.starts_with("/john ") {
-            let command = "john";
-            let message = input.trim_start_matches("/john ").trim();
-            if self.handle_identity_command(command, message, app, target.clone()) {
-                return true;
-            }
-            // Fall back to hardcoded implementation
-            if !message.is_empty() {
-                // First set profile to JohnDoe with pink color #FC129E (no incognito)
-                self.post_msg(PostType::Profile("#FC129E".to_owned(), "JohnDoe".to_owned(), true, false, false))
-                    .unwrap();
-                
-                // Check if this is a kick command
-                if let Some(captures) = KICK_RGX.captures(message) {
-                    // Handle kick command
-                    let username = captures[1].to_owned();
-                    let kick_msg = captures[2].to_owned();
-                    let tx = self.tx.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Kick(kick_msg, username));
-                        
-                        // Add another delay before restoring profile
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), "Dasho".to_owned(), true, true, true));
-                    });
-                } else {
-                    // Handle regular message
-                    let tx = self.tx.clone();
-                    let message_clone = message.to_owned();
-                    let target_clone = target.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(1000));  // Increased to 1 second
-                        let _ = tx.send(PostType::Post(message_clone, target_clone));
-                        
-                        // Add another delay before restoring profile
-                        thread::sleep(Duration::from_millis(1000));  // Increased to 1 second
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), "Dasho".to_owned(), true, true, true));
-                    });
-                }
-            }
-            app.input = "/john ".to_owned();
-            app.input_idx = app.input.width();
-        } else if input.starts_with("/intel ") {
-            let command = "intel";
-            let message = input.trim_start_matches("/intel ").trim();
-            if self.handle_identity_command(command, message, app, target.clone()) {
-                return true;
-            }
-            // Fall back to hardcoded implementation
-            if !message.is_empty() {
-                // First set profile to intelroker with red color #FF1212 (no incognito)
-                self.post_msg(PostType::Profile("#FF1212".to_owned(), "intelroker".to_owned(), true, true, false))
-                    .unwrap();
-                
-                // Check if this is a kick command
-                if let Some(captures) = KICK_RGX.captures(message) {
-                    // Handle kick command
-                    let username = captures[1].to_owned();
-                    let kick_msg = captures[2].to_owned();
-                    let tx = self.tx.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Kick(kick_msg, username));
-                        
-                        // Add another delay before restoring profile
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), "Dasho".to_owned(), true, true, true));
-                    });
-                } else {
-                    // Handle regular message
-                    let tx = self.tx.clone();
-                    let message_clone = message.to_owned();
-                    let target_clone = target.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(1000));  // Increased to 1 second
-                        let _ = tx.send(PostType::Post(message_clone, target_clone));
-                        
-                        // Add another delay before restoring profile
-                        thread::sleep(Duration::from_millis(1000));  // Increased to 1 second
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), "Dasho".to_owned(), true, true, true));
-                    });
-                }
-            }
-            app.input = "/intel ".to_owned();
-            app.input_idx = app.input.width();
-        } else if input.starts_with("/op ") {
-            let command = "op";
-            let message = input.trim_start_matches("/op ").trim();
-            if self.handle_identity_command(command, message, app, target.clone()) {
-                return true;
-            }
-            // Fall back to hardcoded implementation
-            if !message.is_empty() {
-                // First set profile to Operator with green color #00FF88
-                self.post_msg(PostType::Profile("#00FF88".to_owned(), "Operator".to_owned(), true, false, false))
-                    .unwrap();
-                
-                // Check if this is a kick command
-                if let Some(captures) = KICK_RGX.captures(message) {
-                    // Handle kick command
-                    let username = captures[1].to_owned();
-                    let kick_msg = captures[2].to_owned();
-                    let tx = self.tx.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Kick(kick_msg, username));
-                        
-                        // Add another delay before restoring profile
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), "Dasho".to_owned(), true, true, true));
-                    });
-                } else {
-                    // Handle regular message
-                    let tx = self.tx.clone();
-                    let message_clone = message.to_owned();
-                    let target_clone = target.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Post(message_clone, target_clone));
-                        
-                        // Add another delay before restoring profile
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), "Dasho".to_owned(), true, true, true));
-                    });
-                }
-            }
-            app.input = "/op ".to_owned();
-            app.input_idx = app.input.width();
-        } else if input.starts_with("/shadow ") {
-            let message = input.trim_start_matches("/shadow ").trim();
-            if !message.is_empty() {
-                // First set profile to ShadowUser with dark gray color #2C2C2C
-                self.post_msg(PostType::Profile("#2C2C2C".to_owned(), "ShadowUser".to_owned(), true, false, false))
-                    .unwrap();
-                
-                // Check if this is a kick command
-                if let Some(captures) = KICK_RGX.captures(message) {
-                    // Handle kick command
-                    let username = captures[1].to_owned();
-                    let kick_msg = captures[2].to_owned();
-                    let tx = self.tx.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Kick(kick_msg, username));
-                        
-                        // Add another delay before restoring profile
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), "Dasho".to_owned(), true, true, true));
-                    });
-                } else {
-                    // Handle regular message
-                    let tx = self.tx.clone();
-                    let message_clone = message.to_owned();
-                    let target_clone = target.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Post(message_clone, target_clone));
-                        
-                        // Add another delay before restoring profile
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), "Dasho".to_owned(), true, true, true));
-                    });
-                }
-            }
-            app.input = "/shadow ".to_owned();
-            app.input_idx = app.input.width();
-        } else if input.starts_with("/ghost ") {
-            let message = input.trim_start_matches("/ghost ").trim();
-            if !message.is_empty() {
-                // First set profile to Ghost with light gray color #CCCCCC
-                self.post_msg(PostType::Profile("#CCCCCC".to_owned(), "Ghost".to_owned(), true, true, false))
-                    .unwrap();
-                
-                // Check if this is a kick command
-                if let Some(captures) = KICK_RGX.captures(message) {
-                    // Handle kick command
-                    let username = captures[1].to_owned();
-                    let kick_msg = captures[2].to_owned();
-                    let tx = self.tx.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Kick(kick_msg, username));
-                        
-                        // Add another delay before restoring profile
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), "Dasho".to_owned(), true, true, true));
-                    });
-                } else {
-                    // Handle regular message
-                    let tx = self.tx.clone();
-                    let message_clone = message.to_owned();
-                    let target_clone = target.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Post(message_clone, target_clone));
-                        
-                        // Add another delay before restoring profile
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), "Dasho".to_owned(), true, true, true));
-                    });
-                }
-            }
-            app.input = "/ghost ".to_owned();
-            app.input_idx = app.input.width();
-        } else if input.starts_with("/cyber ") {
-            let message = input.trim_start_matches("/cyber ").trim();
-            if !message.is_empty() {
-                // First set profile to CyberNinja with electric blue color #00FFFF
-                self.post_msg(PostType::Profile("#00FFFF".to_owned(), "CyberNinja".to_owned(), true, false, false))
-                    .unwrap();
-                
-                // Check if this is a kick command
-                if let Some(captures) = KICK_RGX.captures(message) {
-                    // Handle kick command
-                    let username = captures[1].to_owned();
-                    let kick_msg = captures[2].to_owned();
-                    let tx = self.tx.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Kick(kick_msg, username));
-                        
-                        // Add another delay before restoring profile
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), "Dasho".to_owned(), true, true, true));
-                    });
-                } else {
-                    // Handle regular message
-                    let tx = self.tx.clone();
-                    let message_clone = message.to_owned();
-                    let target_clone = target.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Post(message_clone, target_clone));
-                        
-                        // Add another delay before restoring profile
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), "Dasho".to_owned(), true, true, true));
-                    });
-                }
-            }
-            app.input = "/cyber ".to_owned();
-            app.input_idx = app.input.width();
-        } else if input.starts_with("/viper ") {
-            let message = input.trim_start_matches("/viper ").trim();
-            if !message.is_empty() {
-                // First set profile to ViperX with green color #00FF00
-                self.post_msg(PostType::Profile("#00FF00".to_owned(), "ViperX".to_owned(), true, false, false))
-                    .unwrap();
-                
-                // Check if this is a kick command
-                if let Some(captures) = KICK_RGX.captures(message) {
-                    // Handle kick command
-                    let username = captures[1].to_owned();
-                    let kick_msg = captures[2].to_owned();
-                    let tx = self.tx.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Kick(kick_msg, username));
-                        
-                        // Add another delay before restoring profile
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), "Dasho".to_owned(), true, true, true));
-                    });
-                } else {
-                    // Handle regular message
-                    let tx = self.tx.clone();
-                    let message_clone = message.to_owned();
-                    let target_clone = target.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Post(message_clone, target_clone));
-                        
-                        // Add another delay before restoring profile
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), "Dasho".to_owned(), true, true, true));
-                    });
-                }
-            }
-            app.input = "/viper ".to_owned();
-            app.input_idx = app.input.width();
-        } else if input.starts_with("/phoenix ") {
-            let message = input.trim_start_matches("/phoenix ").trim();
-            if !message.is_empty() {
-                // First set profile to PhoenixRise with orange color #FF8C00
-                self.post_msg(PostType::Profile("#FF8C00".to_owned(), "PhoenixRise".to_owned(), true, false, false))
-                    .unwrap();
-                
-                // Check if this is a kick command
-                if let Some(captures) = KICK_RGX.captures(message) {
-                    // Handle kick command
-                    let username = captures[1].to_owned();
-                    let kick_msg = captures[2].to_owned();
-                    let tx = self.tx.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Kick(kick_msg, username));
-                        
-                        // Add another delay before restoring profile
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), "Dasho".to_owned(), true, true, true));
-                    });
-                } else {
-                    // Handle regular message
-                    let tx = self.tx.clone();
-                    let message_clone = message.to_owned();
-                    let target_clone = target.clone();
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Post(message_clone, target_clone));
-                        
-                        // Add another delay before restoring profile
-                        thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile("#77767B".to_owned(), "Dasho".to_owned(), true, true, true));
-                    });
-                }
-            }
-            app.input = "/phoenix ".to_owned();
-            app.input_idx = app.input.width();
         } else if input.starts_with("/hide on") {
             // Toggle incognito mode on
             self.post_msg(PostType::SetIncognito(true)).unwrap();
@@ -1717,6 +1503,15 @@ impl LeChatPHPClient {
             let msg = "Incognito mode DISABLED - you will be visible on the guest list".to_string();
             self.post_msg(PostType::Post(msg, Some("0".to_owned())))
                 .unwrap();
+        } else if input.starts_with("/switch ") {
+            // Alias for /identity switch
+            let command = input.trim_start_matches("/switch ");
+            match self.switch_to_identity(command) {
+                Ok(()) => {}, // Success message already sent by helper
+                Err(msg) => {
+                    self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+                }
+            }
         } else if input.starts_with("/identity ") {
             let rest = input.trim_start_matches("/identity ");
             if rest == "list" {
@@ -1738,6 +1533,8 @@ impl LeChatPHPClient {
                     let command = parts[1];
                     let nickname = parts[2];
                     let color = parts[3];
+                    // Trim quotes from color if present
+                    let color = color.trim_matches('"').trim_matches('\'');
                     // Create a complete config: [nickname, color, incognito, bold, italic]
                     let config = vec![
                         nickname.to_string(), 
@@ -1785,8 +1582,16 @@ impl LeChatPHPClient {
                     let msg = format!("Identity /{} not found", command);
                     self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
                 }
+            } else if rest.starts_with("switch ") {
+                let command = rest.trim_start_matches("switch ");
+                match self.switch_to_identity(command) {
+                    Ok(()) => {}, // Success message already sent by helper
+                    Err(msg) => {
+                        self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+                    }
+                }
             } else {
-                let msg = "Usage: /identity list | add <command> <nickname> <color> | remove <command>".to_string();
+                let msg = "Usage: /identity list | add <command> <nickname> <color> | remove <command> | switch <command>".to_string();
                 self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
             }
         } else if input.starts_with('/') && input.contains(' ') {
@@ -1816,107 +1621,114 @@ impl LeChatPHPClient {
             let help_text = r#"Available Commands:
 
 Chat Commands:
-/pm <user> <message>     - Send private message to user
-/m <message>             - Send message to members only
-/s <message>             - Send message to staff only
+/pm [user] [message] - Send private message to user
+/m [message] - Send message to members only
+/s [message] - Send message to staff only
 
-Identity Commands (send as different users, then restore to Dasho):
-/john <message>          - Send as JohnDoe with pink color, then restore
-/intel <message>         - Send as intelroker with red color, then restore
-/op <message>            - Send as Operator with white color, then restore
-/shadow <message>        - Send as ShadowUser with dark gray color, then restore
-/ghost <message>         - Send as Ghost with light gray color, then restore
-/cyber <message>         - Send as CyberNinja with electric blue color, then restore
-/viper <message>         - Send as ViperX with green color, then restore
-/phoenix <message>       - Send as PhoenixRise with orange color, then restore
-                          (All identity commands support targeting: /m /john, /s /intel, /pm user /op)
-                          (Custom identities can be configured - see Identity Configuration below)
+Identity Commands (send as different users, then restore to original user):
+/john [message] - Send as JohnDoe with pink color, then restore
+/intel [message] - Send as intelroker with red color, then restore
+/op [message] - Send as Operator with white color, then restore
+/shadow [message] - Send as ShadowUser with dark gray color, then restore
+/ghost [message] - Send as Ghost with light gray color, then restore
+/cyber [message] - Send as CyberNinja with electric blue color, then restore
+/viper [message] - Send as ViperX with green color, then restore
+/phoenix [message] - Send as PhoenixRise with orange color, then restore
+(All identity commands support targeting: /m /john, /s /intel, /pm user /op)
+(Custom identities can be configured - see Identity Configuration below)
 
 Identity Configuration:
-/identity list           - List all configured custom identities
-/identity add <cmd> <nick> <color> - Add custom identity (/cmd nickname #color)
-/identity remove <cmd>   - Remove custom identity command
+/identity list - List all configured custom identities
+/identity add [cmd] [nick] [color] - Add custom identity (/cmd nickname #color)
+/identity remove [cmd] - Remove custom identity command
+/identity switch [cmd] - Permanently switch to the specified identity
+/switch [cmd] - Alias for /identity switch (quick identity switching)
 
 ChatOps Developer Commands (30+ tools available):
-/man <command>           - Manual pages for system commands
-/doc <lang> <term>       - Language-specific documentation
-/github <user/repo>      - GitHub repository information
-/crates <crate>          - Rust crate information from crates.io
-/npm <package>           - NPM package information
-/hash <algo> <text>      - Generate cryptographic hashes
-/uuid                    - Generate UUID v4
-/base64 <encode|decode>  - Base64 encoding/decoding
-/regex <pattern> <text>  - Test regular expressions
-/whois <domain>          - Domain WHOIS lookup
-/dig <domain>            - DNS record lookup
-/ping <host>             - Test network connectivity
-/time                    - Current timestamp info
-/explain <concept>       - AI explanations of concepts
-/translate <lang> <text> - Translate text between languages
+/man [command] - Manual pages for system commands
+/doc [lang] [term] - Language-specific documentation
+/github [user/repo] - GitHub repository information
+/crates [crate] - Rust crate information from crates.io
+/npm [package] - NPM package information
+/hash [algo] [text] - Generate cryptographic hashes
+/uuid - Generate UUID v4
+/base64 [encode|decode] - Base64 encoding/decoding
+/regex [pattern] [text] - Test regular expressions
+/whois [domain] - Domain WHOIS lookup
+/dig [domain] - DNS record lookup
+/ping [host] - Test network connectivity
+/time - Current timestamp info
+/explain [concept] - AI explanations of concepts
+/translate [lang] [text] - Translate text between languages
 ... and 15+ more tools
 
 Use '/commands' to see all ChatOps commands for your role.
-Use '/help <command>' for detailed help on ChatOps commands.
+Use '/help [command]' for detailed help on ChatOps commands.
 
 ChatOps Command Prefixes:
-/pm <user> /command      - Send ChatOps result as PM to user
-/m /command              - Send ChatOps result to members channel
-/s /command              - Send ChatOps result to staff channel
-(no prefix)              - Send ChatOps result to main chat
+/pm [user] /command - Send ChatOps result as PM to user
+/m /command - Send ChatOps result to members channel
+/s /command - Send ChatOps result to staff channel
+(no prefix) - Send ChatOps result to main chat
 
 AI Commands:
-/ai off                  - Completely disable AI (no moderation, no replies)
-/ai mod                  - Enable moderation only (kicks/bans harmful messages)
-/ai reply all            - Enable replies to all messages + moderation
-/ai reply ping           - Enable replies only when tagged + moderation
-/ai strict               - Set AI moderation to strict mode (very strict)
-/ai balanced             - Set AI moderation to balanced mode (default)
-/ai lenient              - Set AI moderation to lenient mode (very lenient)
-/check ai                - Check AI system status and OpenAI connection
-/check mod <message>     - Test AI moderation response for a message
-/modlog on/off           - Enable/disable moderation logging to @0
-/warnings                - Show current warning counts for users
-/clearwarn <user>        - Clear warnings for specific user
-/clearwarn all           - Clear all user warnings
+/ai off - Completely disable AI (no moderation, no replies)
+/ai mod - Enable moderation only (kicks/bans harmful messages)
+/ai reply all - Enable replies to all messages + moderation
+/ai reply ping - Enable replies only when tagged + moderation
+/ai strict - Set AI moderation to strict mode (very strict)
+/ai balanced - Set AI moderation to balanced mode (default)
+/ai lenient - Set AI moderation to lenient mode (very lenient)
+/check ai - Check AI system status and OpenAI connection
+/check mod [message] - Test AI moderation response for a message
+/modlog on/off - Enable/disable moderation logging to @0
+/warnings - Show current warning counts for users
+/clearwarn [user] - Clear warnings for specific user
+/clearwarn all - Clear all user warnings
+
+Inbox Commands:
+Shift+O - Toggle inbox view (view offline PMs)
+x (in inbox) - Delete selected inbox message
+/clearinbox - Clear all inbox messages (only in inbox mode)
 
 Moderation Commands:
-/kick <user> <reason>    - Kick user with reason
-/ban <username>          - Ban username (partial match)
-/ban "<exact>"           - Ban exact username (use quotes)
-/unban <username>        - Remove username ban
-/unfilter <text>         - Remove message filter
-/filter <text>           - Filter messages containing text (same as /banmsg)
-/allow <user>            - Add user to allowlist (bypass filters)
-/revoke <user>           - Remove user from allowlist
-/banlist                 - Show banned usernames
-/filterlist              - Show filtered message terms
-/allowlist               - Show allowlisted users
-!warn [@user]            - Send warning message
+/kick [user] [reason] - Kick user with reason
+/ban [username] - Ban username (partial match)
+/ban "[exact]" - Ban exact username (use quotes)
+/unban [username] - Remove username ban
+/unfilter [text] - Remove message filter
+/filter [text] - Filter messages containing text (same as /banmsg)
+/allow [user] - Add user to allowlist (bypass filters)
+/revoke [user] - Remove user from allowlist
+/banlist - Show banned usernames
+/filterlist - Show filtered message terms
+/allowlist - Show allowlisted users
+!warn [@user] - Send warning message
 
 Message Management:
-/dl                      - Delete last message
-/dl<number>              - Delete last N messages (e.g., /dl5)
-/dall                    - Delete all messages
-/delete <msg_id>         - Delete specific message by ID
+/dl - Delete last message
+/dl[number] - Delete last N messages (e.g., /dl5)
+/dall - Delete all messages
+/delete [msg_id] - Delete specific message by ID
 
 Account Management:
-/set alt <username>      - Set alt account for forwarding
-/set master <username>   - Set master account for PMs
-/alt on/off              - Enable/disable alt message forwarding
+/set alt [username] - Set alt account for forwarding
+/set master [username] - Set master account for PMs
+/alt on/off - Enable/disable alt message forwarding
 
 File Upload:
-/upload <path> [to] [msg] - Upload file (to: members/staffs/admins/all)
+/upload [path] [to] [msg] - Upload file (to: members/staffs/admins/all)
 
 Visual/Color:
-/nick <nickname>         - Change nickname
-/color <hex>             - Change color (#ff0000)
-/cycle1                  - Start color cycling
-/cycle2                  - Start name + color cycling
-/cycles                  - Stop cycling
+/nick [nickname] - Change nickname
+/color [hex] - Change color (#ff0000)
+/cycle1 - Start color cycling
+/cycle2 - Start name + color cycling
+/cycles - Stop cycling
 
 Utility:
-/status                  - Show current settings and status
-/help                    - Show this help message
+/status - Show current settings and status
+/help - Show this help message
 
 Note: Some commands require appropriate permissions."#;
             
@@ -2119,6 +1931,48 @@ Connection:
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => self.handle_long_message_mode_key_event_ctrl_d(app, messages),
+            KeyEvent {
+                code: KeyCode::Char('j'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Down,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                // Scroll down
+                app.long_message_scroll_offset = app.long_message_scroll_offset.saturating_add(1);
+            }
+            KeyEvent {
+                code: KeyCode::Char('k'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Up,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                // Scroll up
+                app.long_message_scroll_offset = app.long_message_scroll_offset.saturating_sub(1);
+            }
+            KeyEvent {
+                code: KeyCode::PageUp,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                // Scroll up by 10 lines
+                app.long_message_scroll_offset = app.long_message_scroll_offset.saturating_sub(10);
+            }
+            KeyEvent {
+                code: KeyCode::PageDown,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                // Scroll down by 10 lines
+                app.long_message_scroll_offset = app.long_message_scroll_offset.saturating_add(10);
+            }
             _ => {}
         }
         Ok(())
@@ -2257,7 +2111,12 @@ Connection:
                 code: KeyCode::Char('C'),
                 modifiers: KeyModifiers::SHIFT,
                 ..
-            } => self.handle_normal_mode_key_event_shift_c(messages),
+            } => self.handle_normal_mode_key_event_shift_c(app),
+            KeyEvent {
+                code: KeyCode::Char('O'),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => self.handle_normal_mode_key_event_shift_o(app),
             KeyEvent {
                 code: KeyCode::Char('H'),
                 modifiers: KeyModifiers::SHIFT,
@@ -2315,6 +2174,11 @@ Connection:
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => self.handle_normal_mode_key_event_warn(app),
+            KeyEvent {
+                code: KeyCode::Char(' '),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => self.handle_normal_mode_key_event_space(app),
             KeyEvent {
                 code: KeyCode::Char('x'),
                 modifiers: KeyModifiers::NONE,
@@ -2521,22 +2385,64 @@ Connection:
     }
 
     fn handle_normal_mode_key_event_up(&mut self, app: &mut App) {
-        app.items.previous()
+        if app.inbox_mode {
+            app.inbox_items.previous();
+        } else if app.clean_mode {
+            app.clean_items.previous();
+        } else {
+            app.items.previous();
+        }
     }
 
     fn handle_normal_mode_key_event_down(&mut self, app: &mut App) {
-        app.items.next()
+        if app.inbox_mode {
+            app.inbox_items.next();
+        } else if app.clean_mode {
+            app.clean_items.next();
+        } else {
+            app.items.next();
+        }
+    }
+
+    fn handle_normal_mode_key_event_space(&mut self, app: &mut App) {
+        if app.inbox_mode {
+            // Toggle checkbox for selected inbox message
+            if let Some(idx) = app.inbox_items.state.selected() {
+                if let Some(message) = app.inbox_items.items.get_mut(idx) {
+                    message.selected = !message.selected;
+                }
+            }
+        } else if app.clean_mode {
+            // Toggle checkbox for selected clean message
+            if let Some(idx) = app.clean_items.state.selected() {
+                if let Some(message) = app.clean_items.items.get_mut(idx) {
+                    message.selected = !message.selected;
+                }
+            }
+        }
     }
 
     fn handle_normal_mode_key_event_j(&mut self, app: &mut App, lines: usize) {
         for _ in 0..lines {
-            app.items.next(); // Move to the next item
+            if app.inbox_mode {
+                app.inbox_items.next();
+            } else if app.clean_mode {
+                app.clean_items.next();
+            } else {
+                app.items.next();
+            }
         }
     }
 
     fn handle_normal_mode_key_event_k(&mut self, app: &mut App, lines: usize) {
         for _ in 0..lines {
-            app.items.previous(); // Move to the next item
+            if app.inbox_mode {
+                app.inbox_items.previous();
+            } else if app.clean_mode {
+                app.clean_items.previous();
+            } else {
+                app.items.previous();
+            }
         }
     }
 
@@ -2568,6 +2474,7 @@ Connection:
                     return;
                 }
                 app.long_message = Some(item.clone());
+                app.long_message_scroll_offset = 0;
                 app.input_mode = InputMode::LongMessage;
             }
         }
@@ -2775,7 +2682,7 @@ Connection:
 
     fn handle_normal_mode_key_event_shift_c(
         &mut self,
-        messages: &Arc<Mutex<Vec<Message>>>,
+        app: &mut App,
     ) {
         if self.clean_mode {
             self.clean_mode = false;
@@ -2789,11 +2696,32 @@ Connection:
                 session,
             ) {
                 Ok(msgs) => {
-                    let mut lock = messages.lock().unwrap();
-                    *lock = msgs;
+                    app.clean_items.items = msgs;
+                    app.clean_items.state.select(None);
                     self.clean_mode = true;
                 }
                 Err(e) => log::error!("failed to load clean view: {}", e),
+            }
+        }
+    }
+
+    fn handle_normal_mode_key_event_shift_o(&mut self, app: &mut App) {
+        if self.inbox_mode {
+            self.inbox_mode = false;
+            return;
+        }
+        if let Some(session) = &self.session {
+            match fetch_inbox_messages(
+                &self.client,
+                &self.config.url,
+                session,
+            ) {
+                Ok(msgs) => {
+                    app.inbox_items.items = msgs;
+                    app.inbox_items.state.select(None);
+                    self.inbox_mode = true;
+                }
+                Err(e) => log::error!("failed to load inbox view: {}", e),
             }
         }
     }
@@ -2998,6 +2926,102 @@ Connection:
         app: &mut App,
         messages: &Arc<Mutex<Vec<Message>>>,
     ) {
+        if app.inbox_mode {
+            // Handle deletion in inbox mode - delete all checked messages
+            let mut indices_to_remove = Vec::new();
+            let mut message_ids_to_delete = Vec::new();
+            
+            for (idx, message) in app.inbox_items.items.iter().enumerate() {
+                if message.selected {
+                    let message_id = message.id.clone();
+                    message_ids_to_delete.push(message_id);
+                    indices_to_remove.push(idx);
+                }
+            }
+            
+            // Remove messages from UI immediately
+            for &idx in indices_to_remove.iter().rev() {
+                app.inbox_items.items.remove(idx);
+            }
+            
+            // Adjust selection
+            if app.inbox_items.items.is_empty() {
+                app.inbox_items.state.select(None);
+            } else if let Some(selected) = app.inbox_items.state.selected() {
+                if selected >= app.inbox_items.items.len() {
+                    app.inbox_items.state.select(Some(app.inbox_items.items.len() - 1));
+                }
+            }
+            
+            // Send delete requests in background thread
+            if !message_ids_to_delete.is_empty() {
+                let client = self.client.clone();
+                let session = self.session.clone();
+                let url = self.config.url.clone();
+                thread::spawn(move || {
+                    if let Some(session) = session {
+                        for message_id in message_ids_to_delete {
+                            let delete_url = format!("{}?action=inbox&session={}", url, session);
+                            let form = reqwest::blocking::multipart::Form::new()
+                                .text("lang", "en")
+                                .text("action", "inbox")
+                                .text("session", session.clone())
+                                .text("do", "delete")
+                                .text("mid[]", message_id.clone());
+                            
+                            if let Err(e) = client.post(&delete_url).multipart(form).send() {
+                                log::error!("Failed to delete inbox message {}: {}", message_id, e);
+                            }
+                        }
+                    }
+                });
+            }
+            return;
+        }
+        
+        if app.clean_mode {
+            // Handle deletion in clean mode - delete all checked messages
+            let mut indices_to_remove = Vec::new();
+            let mut message_ids_to_delete = Vec::new();
+            
+            for (idx, message) in app.clean_items.items.iter().enumerate() {
+                if message.selected {
+                    let message_id = message.id.clone();
+                    message_ids_to_delete.push(message_id);
+                    indices_to_remove.push(idx);
+                }
+            }
+            
+            // Remove messages from UI immediately
+            for &idx in indices_to_remove.iter().rev() {
+                app.clean_items.items.remove(idx);
+            }
+            
+            // Adjust selection
+            if app.clean_items.items.is_empty() {
+                app.clean_items.state.select(None);
+            } else if let Some(selected) = app.clean_items.state.selected() {
+                if selected >= app.clean_items.items.len() {
+                    app.clean_items.state.select(Some(app.clean_items.items.len() - 1));
+                }
+            }
+            
+            // Send delete requests in background thread
+            if !message_ids_to_delete.is_empty() {
+                let tx = self.tx.clone();
+                thread::spawn(move || {
+                    for message_id in message_ids_to_delete {
+                        let message_id_for_log = message_id.clone();
+                        if let Err(e) = tx.send(PostType::Delete(message_id)) {
+                            log::error!("Failed to send delete request for message {}: {}", message_id_for_log, e);
+                        }
+                    }
+                });
+            }
+            return;
+        }
+        
+        // Regular message deletion
         if let Some(idx) = app.items.state.selected() {
             if let Some(id) = app.items.items.get(idx).and_then(|m| m.id) {
                 if self.clean_mode {
@@ -5183,7 +5207,7 @@ fn fetch_clean_messages(
     base_url: &str,
     page_php: &str,
     session: &str,
-) -> anyhow::Result<Vec<Message>> {
+) -> anyhow::Result<Vec<CleanMessage>> {
     let full_url = format!("{}/{}", base_url, page_php);
     let url = format!("{}?action=post&session={}", full_url, session);
     let resp_text = client.get(&url).send()?.text()?;
@@ -5203,8 +5227,123 @@ fn fetch_clean_messages(
     ];
     let clean_resp_txt = client.post(&full_url).form(&params).send()?.text()?;
     let doc = Document::from(clean_resp_txt.as_str());
-    let msgs = extract_messages(&doc)?;
-    Ok(msgs)
+    
+    let mut messages = Vec::new();
+    
+    // Parse the HTML for clean messages with checkboxes
+    for div in doc.find(Attr("class", "msg")) {
+        if let Some(checkbox) = div.find(Name("input")).next() {
+            if let Some(value) = checkbox.attr("value") {
+                let message_id = value.to_string();
+                
+                // Extract the message content
+                let full_text = div.text();
+                
+                // Parse the date, sender, and content from the message
+                // Format varies in clean mode, try to extract what we can
+                if let Some(date_end) = full_text.find(" - ") {
+                    let date = full_text[..date_end].trim().to_string();
+                    let rest = &full_text[date_end + 3..];
+                    
+                    // Try to extract username and content
+                    let mut from = "Unknown".to_string();
+                    let mut content = rest.to_string();
+                    
+                    // Look for patterns like [username] or <username>
+                    if let Some(bracket_start) = rest.find('[') {
+                        if let Some(bracket_end) = rest.find(']') {
+                            from = rest[bracket_start + 1..bracket_end].trim().to_string();
+                            content = rest[bracket_end + 1..].trim_start_matches(" - ").to_string();
+                        }
+                    } else if let Some(angle_start) = rest.find('<') {
+                        if let Some(angle_end) = rest.find('>') {
+                            from = rest[angle_start + 1..angle_end].trim().to_string();
+                            content = rest[angle_end + 1..].trim_start_matches(" - ").to_string();
+                        }
+                    } else {
+                        // If no clear username pattern, try to extract first word as username
+                        if let Some(space_pos) = rest.find(' ') {
+                            from = rest[..space_pos].trim().to_string();
+                            content = rest[space_pos + 1..].to_string();
+                        }
+                    }
+                    
+                    messages.push(CleanMessage::new(
+                        message_id,
+                        date,
+                        from,
+                        content,
+                    ));
+                } else {
+                    // Fallback for messages without clear date format
+                    messages.push(CleanMessage::new(
+                        message_id,
+                        "Unknown".to_string(),
+                        "Unknown".to_string(),
+                        full_text,
+                    ));
+                }
+            }
+        }
+    }
+    
+    Ok(messages)
+}
+
+fn fetch_inbox_messages(
+    client: &Client,
+    base_url: &str,
+    session: &str,
+) -> anyhow::Result<Vec<InboxMessage>> {
+    let url = format!("{}?action=inbox&session={}", base_url, session);
+    
+    let response = client.get(&url).send()?;
+    let text = response.text()?;
+    
+    let document = Document::from(text.as_str());
+    let mut messages = Vec::new();
+    
+    // Parse the HTML for inbox messages
+    for div in document.find(Attr("class", "msg")) {
+        if let Some(checkbox) = div.find(Name("input")).next() {
+            if let Some(value) = checkbox.attr("value") {
+                let message_id = value.to_string();
+                
+                // Extract the message content
+                let full_text = div.text();
+                
+                // Parse the date, sender, recipient, and content from the message
+                // Format: "08-17 00:56:26 - [sender to recipient] - content"
+                if let Some(date_end) = full_text.find(" - ") {
+                    let date = full_text[..date_end].trim().to_string();
+                    let rest = &full_text[date_end + 3..];
+                    
+                    if let Some(bracket_start) = rest.find('[') {
+                        if let Some(bracket_end) = rest.find(']') {
+                            let sender_info = &rest[bracket_start + 1..bracket_end];
+                            let content = rest[bracket_end + 1..].trim_start_matches(" - ").to_string();
+                            
+                            // Parse "sender to recipient"
+                            if let Some(to_pos) = sender_info.find(" to ") {
+                                let from = sender_info[..to_pos].trim().to_string();
+                                let to = sender_info[to_pos + 4..].trim().to_string();
+                                
+                                messages.push(InboxMessage::new(
+                                    message_id,
+                                    date,
+                                    from,
+                                    to,
+                                    content,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(messages)
 }
 
 impl ChatClient {
@@ -5234,6 +5373,10 @@ fn new_default_le_chat_php_client(params: Params) -> LeChatPHPClient {
     let (color_tx, color_rx) = crossbeam_channel::unbounded();
     let (tx, rx) = crossbeam_channel::unbounded();
     let session = params.session.clone();
+    
+    // Store original identity values before moving params
+    let original_username = params.username.clone();
+    let original_color = params.guest_color.clone();
     
     // Load alt forwarding setting from config
     let alt_forwarding_enabled = if let Ok(cfg) = confy::load::<MyConfig>("bhcli", None) {
@@ -5312,7 +5455,10 @@ fn new_default_le_chat_php_client(params: Params) -> LeChatPHPClient {
         display_staff_view: false,
         display_master_pm_view: false,
         clean_mode: false,
+        inbox_mode: false,
         alt_forwarding_enabled: Arc::new(Mutex::new(alt_forwarding_enabled)),
+        current_username: original_username,
+        current_color: original_color,
         ai_enabled: Arc::new(Mutex::new(ai_enabled)),
         ai_mode: Arc::new(Mutex::new(ai_mode)),
         system_intel,
@@ -5445,7 +5591,7 @@ fn get_guest_color(wanted: Option<String>) -> String {
 }
 
 fn get_tor_client(socks_proxy_url: &str, no_proxy: bool) -> Client {
-    let ua = "Dasho's Black Hat Chat Client v0.1-Epic";
+    let ua = "Dasho's Black Hat Chat Client v0.2-Epic";
     let mut builder = reqwest::blocking::ClientBuilder::new()
         .redirect(Policy::none())
         .cookie_store(true)
@@ -5821,6 +5967,51 @@ impl Message {
     }
 }
 
+#[derive(Debug, Clone)]
+struct InboxMessage {
+    id: String,       // message ID for deletion
+    date: String,     // formatted date string
+    from: String,     // sender username
+    to: String,       // recipient (usually "0" or username)
+    content: String,  // message content
+    selected: bool,   // for deletion selection
+}
+
+impl InboxMessage {
+    fn new(id: String, date: String, from: String, to: String, content: String) -> Self {
+        Self {
+            id,
+            date,
+            from,
+            to,
+            content,
+            selected: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CleanMessage {
+    id: String,       // message ID for deletion
+    date: String,     // formatted date string
+    #[allow(dead_code)]
+    from: String,     // sender username
+    content: String,  // message content
+    selected: bool,   // for deletion selection
+}
+
+impl CleanMessage {
+    fn new(id: String, date: String, from: String, content: String) -> Self {
+        Self {
+            id,
+            date,
+            from,
+            content,
+            selected: false,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 enum StyledText {
     Styled(tuiColor, Vec<StyledText>),
@@ -6138,7 +6329,11 @@ fn draw_terminal_frame(
 
             render_help_txt(f, app, chunks[0], username);
             render_textbox(f, app, chunks[1]);
-            render_messages(f, app, chunks[2], messages);
+            if app.clean_mode {
+                render_clean_messages(f, app, chunks[2]);
+            } else {
+                render_messages(f, app, chunks[2], messages);
+            }
             render_users(f, hchunks[1], users);
         }
     } else {
@@ -6154,8 +6349,50 @@ fn draw_terminal_frame(
 
 fn gen_lines(msg_txt: &StyledText, w: usize, line_prefix: &str) -> Vec<Vec<(tuiColor, String)>> {
     let txt = msg_txt.text();
-    let wrapped = textwrap::fill(&txt, w);
-    let splits = wrapped.split("\n").collect::<Vec<&str>>();
+    
+    // For simple text (like help messages), use a much simpler approach
+    // Check if this looks like plain text content (no HTML, just text with newlines)
+    let is_plain_text = !txt.contains('<') && !txt.contains('>') && 
+                       msg_txt.colored_text().iter().all(|(color, _)| *color == tuiColor::White);
+    
+    if is_plain_text {
+        // This is plain text, handle it simply
+        let mut result = Vec::new();
+        
+        // Split by existing newlines first to preserve intended line breaks
+        for original_line in txt.split('\n') {
+            if original_line.len() <= w {
+                // Line fits, add it as-is
+                result.push(vec![(tuiColor::White, original_line.to_string())]);
+            } else {
+                // Line is too long, wrap it
+                let wrapped = textwrap::fill(original_line, w);
+                for wrapped_line in wrapped.split('\n') {
+                    result.push(vec![(tuiColor::White, wrapped_line.to_string())]);
+                }
+            }
+        }
+        return result;
+    }
+    
+    // Fallback to original complex logic for colored text
+    let original_lines: Vec<&str> = txt.split('\n').collect();
+    let mut wrapped_lines = Vec::new();
+    
+    // Only wrap individual lines that are too long
+    for line in original_lines {
+        if line.len() <= w {
+            wrapped_lines.push(line.to_string());
+        } else {
+            // Use textwrap only on lines that are actually too long
+            let wrapped = textwrap::fill(line, w);
+            for wrapped_line in wrapped.split('\n') {
+                wrapped_lines.push(wrapped_line.to_string());
+            }
+        }
+    }
+    
+    let splits = wrapped_lines.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
     let mut new_lines: Vec<Vec<(tuiColor, String)>> = Vec::new();
     let mut ctxt = msg_txt.colored_text();
     ctxt.reverse();
@@ -6237,10 +6474,43 @@ fn render_long_message(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut Ap
             rows.push(Spans::from(spans_vec));
         }
 
-        let messages_list_items = vec![ListItem::new(rows)];
+        // Calculate how many lines can be displayed in the available height
+        let available_height = (r.height - 2) as usize; // -2 for borders
+        let total_lines = rows.len();
+        
+        // Adjust scroll offset to prevent scrolling beyond content
+        let max_scroll = if total_lines > available_height {
+            total_lines - available_height
+        } else {
+            0
+        };
+        app.long_message_scroll_offset = app.long_message_scroll_offset.min(max_scroll);
+        
+        // Apply scrolling by taking a slice of the rows
+        let visible_rows = if total_lines > available_height {
+            rows.into_iter()
+                .skip(app.long_message_scroll_offset)
+                .take(available_height)
+                .collect()
+        } else {
+            rows
+        };
+
+        let messages_list_items: Vec<ListItem> = visible_rows
+            .into_iter()
+            .map(|spans| ListItem::new(spans))
+            .collect();
+
+        let title = if total_lines > available_height {
+            format!("Message (line {}/{}) - j/k or ↑/↓ to scroll, PgUp/PgDn for fast scroll, Enter/Esc to exit", 
+                    app.long_message_scroll_offset + 1, 
+                    total_lines)
+        } else {
+            "Message - Enter/Esc to exit".to_string()
+        };
 
         let messages_list = List::new(messages_list_items)
-            .block(Block::default().borders(Borders::ALL).title(""))
+            .block(Block::default().borders(Borders::ALL).title(title))
             .highlight_style(
                 Style::default()
                     .bg(tuiColor::Rgb(50, 50, 50))
@@ -6343,6 +6613,16 @@ fn render_help_txt(
         let fg = tuiColor::Gray;
         let style = Style::default().fg(fg);
         msg.extend(vec![Span::raw(" | "), Span::styled("C", style)]);
+    }
+
+    if app.inbox_mode {
+        let fg = tuiColor::LightBlue;
+        let style = Style::default().fg(fg).add_modifier(Modifier::BOLD);
+        msg.extend(vec![Span::raw(" | "), Span::styled("O", style)]);
+    } else {
+        let fg = tuiColor::Gray;
+        let style = Style::default().fg(fg);
+        msg.extend(vec![Span::raw(" | "), Span::styled("O", style)]);
     }
     let mut text = Text::from(Spans::from(msg));
     text.patch_style(style);
@@ -6473,6 +6753,11 @@ fn render_messages(
     r: Rect,
     messages: &Arc<Mutex<Vec<Message>>>,
 ) {
+    if app.inbox_mode {
+        render_inbox_messages(f, app, r);
+        return;
+    }
+    
     // Messages
     app.items.items.clear();
     let messages = messages.lock().unwrap();
@@ -6599,6 +6884,86 @@ fn render_messages(
     f.render_stateful_widget(messages_list, r, &mut app.items.state)
 }
 
+fn render_inbox_messages(
+    f: &mut Frame<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    r: Rect,
+) {
+    let messages_list_items: Vec<ListItem> = app.inbox_items.items
+        .iter()
+        .map(|m| {
+            let date_style = Style::default().fg(tuiColor::DarkGray);
+            let from_style = Style::default().fg(tuiColor::LightBlue);
+            let to_style = Style::default().fg(tuiColor::White);
+            let content_style = Style::default().fg(tuiColor::White);
+            let selected_style = Style::default().fg(tuiColor::Red).add_modifier(Modifier::BOLD);
+            
+            let checkbox = if m.selected { "[X]" } else { "[ ]" };
+            let checkbox_span = Span::styled(checkbox, if m.selected { selected_style } else { Style::default() });
+            
+            let spans = vec![
+                checkbox_span,
+                Span::raw(" "),
+                Span::styled(&m.date, date_style),
+                Span::raw(" - ["),
+                Span::styled(&m.from, from_style),
+                Span::raw(" to "),
+                Span::styled(&m.to, to_style),
+                Span::raw("] - "),
+                Span::styled(&m.content, content_style),
+            ];
+            
+            ListItem::new(Spans::from(spans))
+        })
+        .collect();
+
+    let messages_list = List::new(messages_list_items)
+        .block(Block::default().borders(Borders::ALL).title("Inbox (Shift+O to toggle, Space to check/uncheck, 'x' to delete checked, /clearinbox to clear all)"))
+        .highlight_style(
+            Style::default()
+                .bg(tuiColor::Rgb(50, 50, 50))
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_stateful_widget(messages_list, r, &mut app.inbox_items.state)
+}
+
+fn render_clean_messages(
+    f: &mut Frame<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    r: Rect,
+) {
+    let messages_list_items: Vec<ListItem> = app.clean_items.items
+        .iter()
+        .map(|m| {
+            let date_style = Style::default().fg(tuiColor::DarkGray);
+            let content_style = Style::default().fg(tuiColor::White);
+            let selected_style = Style::default().fg(tuiColor::Red).add_modifier(Modifier::BOLD);
+            
+            let checkbox = if m.selected { "[X]" } else { "[ ]" };
+            let checkbox_span = Span::styled(checkbox, if m.selected { selected_style } else { Style::default() });
+            
+            let spans = vec![
+                checkbox_span,
+                Span::raw(" "),
+                Span::styled(&m.date, date_style),
+                Span::raw(" - "),
+                Span::styled(&m.content, content_style),
+            ];
+            
+            ListItem::new(Spans::from(spans))
+        })
+        .collect();
+
+    let messages_list = List::new(messages_list_items)
+        .block(Block::default().borders(Borders::ALL).title("Clean Mode (Shift+C to toggle, Space to check/uncheck, 'x' to delete checked)"))
+        .highlight_style(
+            Style::default()
+                .bg(tuiColor::Rgb(50, 50, 50))
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_stateful_widget(messages_list, r, &mut app.clean_items.state)
+}
+
 fn render_users(f: &mut Frame<CrosstermBackend<io::Stdout>>, r: Rect, users: &Arc<Mutex<Users>>) {
     // Users lists
     let users = users.lock().unwrap();
@@ -6636,7 +7001,7 @@ enum InputMode {
 /// App holds the state of the application
 struct App {
     /// Current value of the input box
-    input: String,
+    struct App {
     input_idx: usize,
     /// Current input mode
     input_mode: InputMode,
@@ -6650,10 +7015,13 @@ struct App {
     display_member_view: bool,
     display_hidden_msgs: bool,
     items: StatefulList<Message>,
+    inbox_items: StatefulList<InboxMessage>,
+    clean_items: StatefulList<CleanMessage>,
     filter: String,
     members_tag: String,
     staffs_tag: String,
     long_message: Option<Message>,
+    long_message_scroll_offset: usize,
     commands: Commands,
 
     alt_account: Option<String>,
@@ -6662,6 +7030,7 @@ struct App {
     display_staff_view: bool,
     display_master_pm_view: bool,
     clean_mode: bool,
+    inbox_mode: bool,
     
     // Multiline input scrolling
     multiline_scroll_offset: usize,
@@ -6670,6 +7039,10 @@ struct App {
     external_editor_active: bool,
 }
 
+
+        // Formatting state for current identity
+        bold: bool,
+        italic: bool,
 impl Default for App {
     fn default() -> App {
         // Read commands from the file and set them as default values
@@ -6715,10 +7088,13 @@ impl Default for App {
             display_member_view: false,
             display_hidden_msgs: false,
             items: StatefulList::new(),
+            inbox_items: StatefulList::new(),
+            clean_items: StatefulList::new(),
             filter: "".to_owned(),
             members_tag: "".to_owned(),
             staffs_tag: "".to_owned(),
             long_message: None,
+            long_message_scroll_offset: 0,
             commands,
             alt_account: None,
             master_account: None,
@@ -6726,6 +7102,7 @@ impl Default for App {
             display_staff_view: false,
             display_master_pm_view: false,
             clean_mode: false,
+            inbox_mode: false,
             multiline_scroll_offset: 0,
             external_editor_active: false,
         }
