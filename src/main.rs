@@ -1,19 +1,30 @@
+mod account_management;
+mod ai_service;
 mod bhc;
+mod bot_client;
+// mod bot_integration;
+mod bot_system;
+mod chatops;
+// mod enhanced_bot_commands;
+// mod enhanced_bot_system;
 mod harm;
 mod lechatphp;
 mod util;
-mod chatops;
 
-use crate::lechatphp::LoginErr;
+use crate::account_management::{AccountManager, AccountRelationshipStatus, parse_enhanced_command};
+use crate::ai_service::AIService;
+use crate::bot_client::BotManager;
+
 use crate::chatops::{ChatOpsRouter, UserRole};
+use crate::lechatphp::LoginErr;
 use anyhow::{anyhow, Context};
 use async_openai::{
     config::OpenAIConfig,
     types::{
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent, 
-        ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent, 
         ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
-        CreateChatCompletionRequestArgs
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+        ChatCompletionRequestSystemMessageContent, ChatCompletionRequestUserMessage,
+        ChatCompletionRequestUserMessageContent, CreateChatCompletionRequestArgs,
     },
     Client as OpenAIClient,
 };
@@ -34,6 +45,7 @@ use crossterm::{
 use harm::{action_from_score, score_message, Action};
 use lazy_static::lazy_static;
 use linkify::LinkFinder;
+
 use log::LevelFilter;
 use log4rs::append::file::FileAppender;
 use log4rs::encode::pattern::PatternEncoder;
@@ -180,7 +192,6 @@ struct MyConfig {
 #[command(name = "bhcli")]
 #[command(author = "Dasho <o_o@dasho.dev>")]
 #[command(version = "0.1.0")]
-
 struct Opts {
     #[arg(long, env = "DKF_API_KEY")]
     dkf_api_key: Option<String>,
@@ -240,6 +251,14 @@ struct Opts {
     bad_messages: Option<Vec<String>>,
     #[arg(skip)]
     allowlist: Option<Vec<String>>,
+
+    // Bot system parameters
+    #[arg(long)]
+    bot: Option<String>,
+    #[arg(long)]
+    bot_admins: Vec<String>,
+    #[arg(long)]
+    bot_data_dir: Option<String>,
 }
 
 struct LeChatPHPConfig {
@@ -297,8 +316,7 @@ struct LeChatPHPClient {
     bad_message_filters: Arc<Mutex<Vec<String>>>,
     allowlist: Arc<Mutex<Vec<String>>>,
 
-    alt_account: Option<String>,
-    master_account: Option<String>,
+    account_manager: AccountManager,
     profile: String,
     display_pm_only: bool,
     display_staff_view: bool,
@@ -306,11 +324,11 @@ struct LeChatPHPClient {
     clean_mode: bool,
     inbox_mode: bool,
     alt_forwarding_enabled: Arc<Mutex<bool>>,
-    
+
     // Store current active identity for restoration
     current_username: String,
     current_color: String,
-    
+
     // AI fields
     ai_enabled: Arc<Mutex<bool>>,
     ai_mode: Arc<Mutex<String>>,
@@ -319,15 +337,23 @@ struct LeChatPHPClient {
     mod_logs_enabled: Arc<Mutex<bool>>,
     openai_client: Option<async_openai::Client<async_openai::config::OpenAIConfig>>,
     ai_conversation_memory: Arc<Mutex<std::collections::HashMap<String, Vec<(String, String)>>>>, // user -> (role, message) history
-    
+
     // Warning tracking for alt mode moderation
     user_warnings: Arc<Mutex<std::collections::HashMap<String, u32>>>, // user -> warning count
-    
+
     // Identity configurations from profile
     identities: HashMap<String, Vec<String>>, // command -> [nickname, color, incognito?, member?, staff?]
-    
+
     // ChatOps system
     chatops_router: ChatOpsRouter,
+
+    // Enhanced AI service
+    ai_service: Arc<AIService>,
+    #[allow(dead_code)]
+    runtime: Arc<Runtime>,
+
+    // Bot system manager
+    bot_manager: Option<Arc<Mutex<BotManager>>>,
 }
 
 impl LeChatPHPClient {
@@ -409,18 +435,25 @@ impl LeChatPHPClient {
             // Check if user is a guest
             let is_guest = {
                 let users_guard = users_clone.lock().unwrap();
-                let is_member_or_staff = users_guard.members.iter().any(|(_, n)| n == &username_clone)
+                let is_member_or_staff = users_guard
+                    .members
+                    .iter()
+                    .any(|(_, n)| n == &username_clone)
                     || users_guard.staff.iter().any(|(_, n)| n == &username_clone)
                     || users_guard.admin.iter().any(|(_, n)| n == &username_clone);
                 !is_member_or_staff
             };
-            
+
             let clb = || {
                 // For guests, send keepalive to @0, otherwise use configured target
-                let target = if is_guest { "0".to_string() } else { send_to.clone() };
+                let target = if is_guest {
+                    "0".to_string()
+                } else {
+                    send_to.clone()
+                };
                 let _ = tx.send(PostType::KeepAlive(target));
             };
-            
+
             // For guests: 25 minutes, for others: 55 minutes
             let timeout_minutes = if is_guest { 25 } else { 55 };
             let timeout = after(Duration::from_secs(60 * timeout_minutes));
@@ -459,7 +492,7 @@ impl LeChatPHPClient {
                         let session_clone = session.clone();
                         let url_clone = url.clone();
                         let last_post_tx_clone = last_post_tx.clone();
-                        
+
                         // Spawn a new thread for each message to prevent race conditions
                         thread::spawn(move || {
                             post_msg(
@@ -506,8 +539,8 @@ impl LeChatPHPClient {
         let bad_exact_usernames = Arc::clone(&self.bad_exact_username_filters);
         let bad_messages = Arc::clone(&self.bad_message_filters);
         let allowlist = Arc::clone(&self.allowlist);
-        let alt_account = self.alt_account.clone();
-        let master_account = self.master_account.clone();
+        let alt_account = self.account_manager.alt_account.clone();
+        let master_account = self.account_manager.master_account.clone();
         let alt_forwarding_enabled = Arc::clone(&self.alt_forwarding_enabled);
         let ai_enabled = Arc::clone(&self.ai_enabled);
         let ai_mode = Arc::clone(&self.ai_mode);
@@ -517,6 +550,8 @@ impl LeChatPHPClient {
         let mod_logs_enabled = Arc::clone(&self.mod_logs_enabled);
         let ai_conversation_memory = Arc::clone(&self.ai_conversation_memory);
         let user_warnings = Arc::clone(&self.user_warnings);
+        let ai_service = Arc::clone(&self.ai_service);
+        let bot_manager = self.bot_manager.clone();
         thread::spawn(move || {
             let (_stream, stream_handle) = OutputStream::try_default().unwrap();
             loop {
@@ -552,6 +587,8 @@ impl LeChatPHPClient {
                     &mod_logs_enabled,
                     &ai_conversation_memory,
                     &user_warnings,
+                    &ai_service,
+                    &bot_manager,
                 ) {
                     log::error!("{}", err);
                 };
@@ -590,7 +627,12 @@ impl LeChatPHPClient {
         let (messages_updated_tx, messages_updated_rx) = crossbeam_channel::unbounded();
         let (last_post_tx, last_post_rx) = crossbeam_channel::unbounded();
 
-        let h1 = self.start_keepalive_thread(sig.lock().unwrap().clone(), last_post_rx, &users, &self.base_client.username);
+        let h1 = self.start_keepalive_thread(
+            sig.lock().unwrap().clone(),
+            last_post_rx,
+            &users,
+            &self.base_client.username,
+        );
         let h2 = self.start_post_msg_thread(sig.lock().unwrap().clone(), last_post_tx);
         let h3 = self.start_get_msgs_thread(&sig, &messages, &users, messages_updated_tx);
 
@@ -619,8 +661,7 @@ impl LeChatPHPClient {
             app.display_master_pm_view = self.display_master_pm_view;
             app.clean_mode = self.clean_mode;
             app.inbox_mode = self.inbox_mode;
-            app.alt_account = self.alt_account.clone();
-            app.master_account = self.master_account.clone();
+            // Account relationships are now managed by the account_manager
             app.members_tag = self.config.members_tag.clone();
             app.staffs_tag = self.config.staffs_tag.clone();
 
@@ -681,33 +722,37 @@ impl LeChatPHPClient {
     fn clear_all_inbox_messages(&self, app: &mut App) -> anyhow::Result<()> {
         if let Some(session) = &self.session {
             let url = format!("{}?action=inbox&session={}", &self.config.url, session);
-            
+
             // Collect all message IDs
-            let message_ids: Vec<String> = app.inbox_items.items.iter().map(|m| m.id.clone()).collect();
-            
+            let message_ids: Vec<String> =
+                app.inbox_items.items.iter().map(|m| m.id.clone()).collect();
+
             if message_ids.is_empty() {
                 return Ok(());
             }
-            
+
             let mut form = reqwest::blocking::multipart::Form::new()
                 .text("lang", "en")
                 .text("action", "inbox")
                 .text("session", session.clone())
                 .text("do", "clean");
-            
+
             // Add all message IDs as checkboxes
             for mid in &message_ids {
                 form = form.text("mid[]", mid.clone());
             }
-            
+
             let response = self.client.post(&url).multipart(form).send()?;
-            
+
             if response.status().is_success() {
                 // Clear local inbox
                 app.inbox_items.items.clear();
                 app.inbox_items.state.select(None);
             } else {
-                return Err(anyhow::anyhow!("Failed to clear inbox: {}", response.status()));
+                return Err(anyhow::anyhow!(
+                    "Failed to clear inbox: {}",
+                    response.status()
+                ));
             }
         }
         Ok(())
@@ -823,11 +868,11 @@ impl LeChatPHPClient {
                 match which {
                     "alt" => {
                         profile_cfg.alt_account = Some(username.clone());
-                        self.alt_account = Some(username.clone());
+                        self.account_manager.set_alt_account(username.clone());
                     }
                     "master" => {
                         profile_cfg.master_account = Some(username.clone());
-                        self.master_account = Some(username.clone());
+                        self.account_manager.set_master_account(username.clone());
                     }
                     _ => return,
                 }
@@ -907,9 +952,9 @@ impl LeChatPHPClient {
     fn determine_user_role(&self) -> UserRole {
         // This is a simplified role determination - in a real implementation,
         // you'd check the user's actual permissions from the server
-        if self.master_account.is_some() {
+        if self.account_manager.master_account.is_some() {
             UserRole::Admin
-        } else if self.alt_account.is_some() {
+        } else if self.account_manager.alt_account.is_some() {
             UserRole::Staff
         } else if !self.display_guest_view {
             UserRole::Member
@@ -918,12 +963,18 @@ impl LeChatPHPClient {
         }
     }
 
-    fn handle_identity_command(&mut self, command: &str, message: &str, app: &mut App, target: Option<String>) -> bool {
+    fn handle_identity_command(
+        &mut self,
+        command: &str,
+        message: &str,
+        app: &mut App,
+        target: Option<String>,
+    ) -> bool {
         if let Some(identity_config) = self.identities.get(command) {
             if identity_config.len() < 2 {
                 return false; // Invalid config, need at least nickname and color
             }
-            
+
             let nickname = identity_config[0].clone();
             let color = identity_config[1].clone();
             // Trim quotes from color if present (for backwards compatibility)
@@ -931,16 +982,22 @@ impl LeChatPHPClient {
             let incognito = identity_config.get(2).map(|s| s == "true").unwrap_or(false);
             let bold = identity_config.get(3).map(|s| s == "true").unwrap_or(false);
             let italic = identity_config.get(4).map(|s| s == "true").unwrap_or(false);
-            
+
             // Store current user info for restoration
             let current_username = self.current_username.clone();
             let current_color = self.current_color.clone();
-            
+
             if !message.is_empty() {
                 // First set profile to the configured identity
-                self.post_msg(PostType::Profile(color.to_string(), nickname, incognito, bold, italic))
-                    .unwrap();
-                
+                self.post_msg(PostType::Profile(
+                    color.to_string(),
+                    nickname,
+                    incognito,
+                    bold,
+                    italic,
+                ))
+                .unwrap();
+
                 // Check if this is a kick command
                 if let Some(captures) = KICK_RGX.captures(message) {
                     // Handle kick command
@@ -950,10 +1007,16 @@ impl LeChatPHPClient {
                     thread::spawn(move || {
                         thread::sleep(Duration::from_millis(2000)); // Increased delay to 2 seconds
                         let _ = tx.send(PostType::Kick(kick_msg, username));
-                        
+
                         // Add another delay before restoring profile
                         thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile(current_color, current_username, true, true, true));
+                        let _ = tx.send(PostType::Profile(
+                            current_color,
+                            current_username,
+                            true,
+                            true,
+                            true,
+                        ));
                     });
                 } else {
                     // Handle regular message
@@ -963,10 +1026,16 @@ impl LeChatPHPClient {
                     thread::spawn(move || {
                         thread::sleep(Duration::from_millis(2000)); // Increased delay to 2 seconds
                         let _ = tx.send(PostType::Post(message_clone, target_clone));
-                        
+
                         // Add another delay before restoring profile
                         thread::sleep(Duration::from_millis(1000));
-                        let _ = tx.send(PostType::Profile(current_color, current_username, true, true, true));
+                        let _ = tx.send(PostType::Profile(
+                            current_color,
+                            current_username,
+                            true,
+                            true,
+                            true,
+                        ));
                     });
                 }
             }
@@ -981,16 +1050,106 @@ impl LeChatPHPClient {
     fn ensure_default_identities(&mut self) {
         // Add default identities if they don't exist
         let defaults = vec![
-            ("admin", vec!["Administrator".to_string(), "#FF4444".to_string(), "false".to_string(), "true".to_string(), "false".to_string()]),
-            ("mod", vec!["Moderator".to_string(), "#FFAA00".to_string(), "false".to_string(), "true".to_string(), "false".to_string()]),
-            ("john", vec!["JohnDoe".to_string(), "#FC129E".to_string(), "false".to_string(), "false".to_string(), "false".to_string()]),
-            ("intel", vec!["intelroker".to_string(), "#FF1212".to_string(), "false".to_string(), "true".to_string(), "false".to_string()]),
-            ("op", vec!["Operator".to_string(), "#00FF88".to_string(), "false".to_string(), "true".to_string(), "false".to_string()]),
-            ("shadow", vec!["ShadowUser".to_string(), "#2C2C2C".to_string(), "false".to_string(), "false".to_string(), "true".to_string()]),
-            ("ghost", vec!["Ghost".to_string(), "#CCCCCC".to_string(), "false".to_string(), "false".to_string(), "false".to_string()]),
-            ("cyber", vec!["CyberNinja".to_string(), "#00FFFF".to_string(), "false".to_string(), "true".to_string(), "true".to_string()]),
-            ("viper", vec!["ViperX".to_string(), "#00FF00".to_string(), "false".to_string(), "true".to_string(), "false".to_string()]),
-            ("phoenix", vec!["PhoenixRise".to_string(), "#FF8C00".to_string(), "false".to_string(), "false".to_string(), "true".to_string()]),
+            (
+                "admin",
+                vec![
+                    "Administrator".to_string(),
+                    "#FF4444".to_string(),
+                    "false".to_string(),
+                    "true".to_string(),
+                    "false".to_string(),
+                ],
+            ),
+            (
+                "mod",
+                vec![
+                    "Moderator".to_string(),
+                    "#FFAA00".to_string(),
+                    "false".to_string(),
+                    "true".to_string(),
+                    "false".to_string(),
+                ],
+            ),
+            (
+                "john",
+                vec![
+                    "JohnDoe".to_string(),
+                    "#FC129E".to_string(),
+                    "false".to_string(),
+                    "false".to_string(),
+                    "false".to_string(),
+                ],
+            ),
+            (
+                "intel",
+                vec![
+                    "intelroker".to_string(),
+                    "#FF1212".to_string(),
+                    "false".to_string(),
+                    "true".to_string(),
+                    "false".to_string(),
+                ],
+            ),
+            (
+                "op",
+                vec![
+                    "Operator".to_string(),
+                    "#00FF88".to_string(),
+                    "false".to_string(),
+                    "true".to_string(),
+                    "false".to_string(),
+                ],
+            ),
+            (
+                "shadow",
+                vec![
+                    "ShadowUser".to_string(),
+                    "#2C2C2C".to_string(),
+                    "false".to_string(),
+                    "false".to_string(),
+                    "true".to_string(),
+                ],
+            ),
+            (
+                "ghost",
+                vec![
+                    "Ghost".to_string(),
+                    "#CCCCCC".to_string(),
+                    "false".to_string(),
+                    "false".to_string(),
+                    "false".to_string(),
+                ],
+            ),
+            (
+                "cyber",
+                vec![
+                    "CyberNinja".to_string(),
+                    "#00FFFF".to_string(),
+                    "false".to_string(),
+                    "true".to_string(),
+                    "true".to_string(),
+                ],
+            ),
+            (
+                "viper",
+                vec![
+                    "ViperX".to_string(),
+                    "#00FF00".to_string(),
+                    "false".to_string(),
+                    "true".to_string(),
+                    "false".to_string(),
+                ],
+            ),
+            (
+                "phoenix",
+                vec![
+                    "PhoenixRise".to_string(),
+                    "#FF8C00".to_string(),
+                    "false".to_string(),
+                    "false".to_string(),
+                    "true".to_string(),
+                ],
+            ),
         ];
 
         for (cmd, config) in defaults {
@@ -1010,14 +1169,14 @@ impl LeChatPHPClient {
                 let incognito = identity_config.get(2).map(|s| s == "true").unwrap_or(false);
                 let bold = identity_config.get(3).map(|s| s == "true").unwrap_or(false);
                 let italic = identity_config.get(4).map(|s| s == "true").unwrap_or(false);
-                
+
                 // Update current identity tracking
                 self.current_username = nickname.clone();
                 self.current_color = color.to_string();
-                
+
                 // Update the base client username for login purposes
                 self.base_client.username = nickname.clone();
-                
+
                 // Save username to config file for future logins
                 if let Ok(mut cfg) = confy::load::<MyConfig>("bhcli", None) {
                     if let Some(profile_cfg) = cfg.profiles.get_mut(&self.profile) {
@@ -1027,16 +1186,22 @@ impl LeChatPHPClient {
                         }
                     }
                 }
-                
+
                 // Permanently switch to the identity
-                self.post_msg(PostType::Profile(color.to_string(), nickname.clone(), incognito, bold, italic))
-                    .unwrap();
-                
+                self.post_msg(PostType::Profile(
+                    color.to_string(),
+                    nickname.clone(),
+                    incognito,
+                    bold,
+                    italic,
+                ))
+                .unwrap();
+
                 // Send confirmation message to @0
                 let confirmation_msg = format!("You are now @{}", nickname);
                 self.post_msg(PostType::Post(confirmation_msg, Some("0".to_owned())))
                     .unwrap();
-                
+
                 Ok(())
             } else {
                 Err(format!("Invalid identity configuration for /{}", command))
@@ -1046,10 +1211,38 @@ impl LeChatPHPClient {
         }
     }
 
-    fn process_command_with_target(&mut self, input: &str, app: &mut App, users: &Arc<Mutex<Users>>, target: Option<String>) -> bool {
-        // First, try ChatOps commands
+    fn process_command_with_target(
+        &mut self,
+        input: &str,
+        app: &mut App,
+        users: &Arc<Mutex<Users>>,
+        target: Option<String>,
+    ) -> bool {
+        // First, check for enhanced command processing (master/alt delegation)
+        if let Some(enhanced_command) = parse_enhanced_command(input, &self.account_manager) {
+            if enhanced_command != input {
+                // Command was transformed, process the enhanced version recursively
+                return self.process_command_with_target(&enhanced_command, app, users, target);
+            }
+        }
+
+        // Check if account relationship is active for status display
+        let relationship_status = self.account_manager.get_relationship_status(users);
+        if matches!(relationship_status, AccountRelationshipStatus::MasterOffline | AccountRelationshipStatus::AltOffline) {
+            // Optionally show status warning (could be toggled via config)
+            if input.trim() == "/status" || input.trim() == "/account" {
+                let status_message = self.account_manager.format_status_message(&relationship_status);
+                self.post_msg(PostType::Post(status_message, target.clone())).unwrap();
+                return true;
+            }
+        }
+
+        // Try ChatOps commands
         let user_role = self.determine_user_role();
-        if let Some(chatops_result) = self.chatops_router.process_command(input, &self.base_client.username, user_role) {
+        if let Some(chatops_result) =
+            self.chatops_router
+                .process_command(input, &self.base_client.username, user_role)
+        {
             // Convert ChatOps result to chat messages
             let messages = chatops_result.to_messages();
             for message in messages {
@@ -1060,11 +1253,12 @@ impl LeChatPHPClient {
                     // Use the provided target, or None for main chat
                     target.clone()
                 };
-                self.post_msg(PostType::Post(message, message_target)).unwrap();
+                self.post_msg(PostType::Post(message, message_target))
+                    .unwrap();
             }
             return true;
         }
-        
+
         // Continue with existing commands
         if input == "/dl" {
             self.post_msg(PostType::DeleteLast).unwrap();
@@ -1116,7 +1310,15 @@ impl LeChatPHPClient {
         } else if let Some(captures) = KICK_RGX.captures(input) {
             let username = captures[1].to_owned();
             let msg = captures[2].to_owned();
-            self.post_msg(PostType::Kick(msg, username)).unwrap();
+
+            // Protect Dasho from being kicked
+            if username.to_lowercase() == "dasho" {
+                let protection_msg = "❌ Cannot kick Dasho - protected user".to_string();
+                self.post_msg(PostType::Post(protection_msg, Some("0".to_owned())))
+                    .unwrap();
+            } else {
+                self.post_msg(PostType::Kick(msg, username)).unwrap();
+            }
         } else if input.starts_with("/banname ") || input.starts_with("/ban ") {
             let mut name = if input.starts_with("/banname ") {
                 remove_prefix(input, "/banname ")
@@ -1128,24 +1330,32 @@ impl LeChatPHPClient {
                 name = &name[1..name.len() - 1];
             }
             let name = name.to_owned();
-            if exact {
-                let mut f = self.bad_exact_username_filters.lock().unwrap();
-                f.push(name.clone());
+
+            // Protect Dasho from being banned
+            if name.to_lowercase().contains("dasho") {
+                let protection_msg = "❌ Cannot ban Dasho - protected user".to_string();
+                self.post_msg(PostType::Post(protection_msg, Some("0".to_owned())))
+                    .unwrap();
             } else {
-                let mut f = self.bad_username_filters.lock().unwrap();
-                f.push(name.clone());
+                if exact {
+                    let mut f = self.bad_exact_username_filters.lock().unwrap();
+                    f.push(name.clone());
+                } else {
+                    let mut f = self.bad_username_filters.lock().unwrap();
+                    f.push(name.clone());
+                }
+                self.save_filters();
+                self.post_msg(PostType::Kick(String::new(), name.clone()))
+                    .unwrap();
+                self.apply_ban_filters(users);
+                let msg = if exact {
+                    format!("Banned exact user \"{}\"", name)
+                } else {
+                    format!("Banned userfilter \"{}\"", name)
+                };
+                self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                    .unwrap();
             }
-            self.save_filters();
-            self.post_msg(PostType::Kick(String::new(), name.clone()))
-                .unwrap();
-            self.apply_ban_filters(users);
-            let msg = if exact {
-                format!("Banned exact user \"{}\"", name)
-            } else {
-                format!("Banned userfilter \"{}\"", name)
-            };
-            self.post_msg(PostType::Post(msg, Some("0".to_owned())))
-                .unwrap();
         } else if input.starts_with("/banmsg ") || input.starts_with("/filter ") {
             let term = if input.starts_with("/banmsg ") {
                 remove_prefix(input, "/banmsg ")
@@ -1270,26 +1480,31 @@ impl LeChatPHPClient {
             *self.ai_enabled.lock().unwrap() = true;
             *self.ai_mode.lock().unwrap() = "mod_only".to_string();
             self.save_ai_config();
-            let msg = "AI set to moderation only mode (kicks/bans harmful messages, no replies)".to_string();
+            let msg = "AI set to moderation only mode (kicks/bans harmful messages, no replies)"
+                .to_string();
             self.post_msg(PostType::Post(msg, Some("0".to_owned())))
                 .unwrap();
         } else if input == "/ai reply all" {
             *self.ai_enabled.lock().unwrap() = true;
             *self.ai_mode.lock().unwrap() = "reply_all".to_string();
             self.save_ai_config();
-            let msg = "AI set to reply all mode (responds to all appropriate messages + moderation)".to_string();
+            let msg =
+                "AI set to reply all mode (responds to all appropriate messages + moderation)"
+                    .to_string();
             self.post_msg(PostType::Post(msg, Some("0".to_owned())))
                 .unwrap();
         } else if input == "/ai reply ping" {
             *self.ai_enabled.lock().unwrap() = true;
             *self.ai_mode.lock().unwrap() = "reply_ping".to_string();
             self.save_ai_config();
-            let msg = "AI set to reply ping mode (responds only when tagged/mentioned + moderation)".to_string();
+            let msg =
+                "AI set to reply ping mode (responds only when tagged/mentioned + moderation)"
+                    .to_string();
             self.post_msg(PostType::Post(msg, Some("0".to_owned())))
                 .unwrap();
         } else if input == "/ai off" {
-            *self.ai_enabled.lock().unwrap() = false;  // Completely disable AI
-            *self.ai_mode.lock().unwrap() = "off".to_string();  // Completely off
+            *self.ai_enabled.lock().unwrap() = false; // Completely disable AI
+            *self.ai_mode.lock().unwrap() = "off".to_string(); // Completely off
             self.save_ai_config();
             let msg = "AI completely disabled (no moderation, no replies)".to_string();
             self.post_msg(PostType::Post(msg, Some("0".to_owned())))
@@ -1316,7 +1531,7 @@ impl LeChatPHPClient {
             let ai_enabled = *self.ai_enabled.lock().unwrap();
             let ai_mode = self.ai_mode.lock().unwrap().clone();
             let has_openai = self.openai_client.is_some();
-            
+
             let status_msg = format!(
                 "AI Status Check:\n- AI Enabled: {}\n- AI Mode: {}\n- OpenAI Client: {}\n- Moderation Strictness: {}",
                 if ai_enabled { "YES" } else { "NO" },
@@ -1324,16 +1539,22 @@ impl LeChatPHPClient {
                 if has_openai { "CONNECTED" } else { "NOT AVAILABLE (check OPENAI_API_KEY)" },
                 self.moderation_strictness
             );
-            
+
             self.post_msg(PostType::Post(status_msg, Some("0".to_owned())))
                 .unwrap();
-                
+
             // Test quick moderation patterns
             let test_messages = vec!["young boy", "hello world", "cheese pizza"];
             for test_msg in test_messages {
                 let quick_result = if let Some(should_moderate) = quick_moderation_check(test_msg) {
-                    if should_moderate { "BLOCK" } else { "FLAG" }
-                } else { "ALLOW" };
+                    if should_moderate {
+                        "BLOCK"
+                    } else {
+                        "FLAG"
+                    }
+                } else {
+                    "ALLOW"
+                };
                 let test_result = format!("Quick test '{}': {}", test_msg, quick_result);
                 self.post_msg(PostType::Post(test_result, Some("0".to_owned())))
                     .unwrap();
@@ -1341,43 +1562,53 @@ impl LeChatPHPClient {
         } else if input.starts_with("/check mod ") {
             let test_message = input.trim_start_matches("/check mod ").trim();
             if test_message.is_empty() {
-                let msg = "Usage: /check mod <message> - Test AI moderation response for a message".to_string();
+                let msg = "Usage: /check mod <message> - Test AI moderation response for a message"
+                    .to_string();
                 self.post_msg(PostType::Post(msg, Some("0".to_owned())))
                     .unwrap();
             } else {
                 let ai_enabled = *self.ai_enabled.lock().unwrap();
                 let has_openai = self.openai_client.is_some();
-                
+
                 if !ai_enabled {
                     let msg = "AI is currently disabled. Enable with /ai mod first.".to_string();
                     self.post_msg(PostType::Post(msg, Some("0".to_owned())))
                         .unwrap();
                 } else if !has_openai {
-                    let msg = "OpenAI client not available. Check OPENAI_API_KEY environment variable.".to_string();
+                    let msg =
+                        "OpenAI client not available. Check OPENAI_API_KEY environment variable."
+                            .to_string();
                     self.post_msg(PostType::Post(msg, Some("0".to_owned())))
                         .unwrap();
                 } else {
                     // First test quick moderation
-                    let quick_result = if let Some(should_moderate) = quick_moderation_check(test_message) {
-                        if should_moderate { "YES (Quick Pattern Match)" } else { "NO (Quick Pattern False)" }
-                    } else { "INCONCLUSIVE (Needs AI Analysis)" };
-                    
+                    let quick_result =
+                        if let Some(should_moderate) = quick_moderation_check(test_message) {
+                            if should_moderate {
+                                "YES (Quick Pattern Match)"
+                            } else {
+                                "NO (Quick Pattern False)"
+                            }
+                        } else {
+                            "INCONCLUSIVE (Needs AI Analysis)"
+                        };
+
                     let quick_msg = format!("Quick Check: '{}' -> {}", test_message, quick_result);
                     self.post_msg(PostType::Post(quick_msg, Some("0".to_owned())))
                         .unwrap();
-                    
+
                     // If quick check didn't catch it, test AI moderation
                     if quick_result == "INCONCLUSIVE (Needs AI Analysis)" {
                         let openai_client = self.openai_client.as_ref().unwrap().clone();
                         let moderation_strictness = self.moderation_strictness.clone();
                         let test_msg = test_message.to_string();
                         let tx = self.tx.clone();
-                        
+
                         // Show that we're starting AI analysis
                         let start_msg = format!("Starting AI analysis for: '{}'...", test_msg);
                         self.post_msg(PostType::Post(start_msg, Some("0".to_owned())))
                             .unwrap();
-                        
+
                         // Use same pattern as process_ai_message - create runtime and spawn thread
                         thread::spawn(move || {
                             let rt = Runtime::new().unwrap();
@@ -1404,7 +1635,8 @@ impl LeChatPHPClient {
         } else if input == "/modlog on" {
             *self.mod_logs_enabled.lock().unwrap() = true;
             self.save_ai_config();
-            let msg = "Moderation logging ENABLED - MOD LOG messages will be sent to @0".to_string();
+            let msg =
+                "Moderation logging ENABLED - MOD LOG messages will be sent to @0".to_string();
             self.post_msg(PostType::Post(msg, Some("0".to_owned())))
                 .unwrap();
         } else if input == "/modlog off" {
@@ -1507,9 +1739,10 @@ impl LeChatPHPClient {
             // Alias for /identity switch
             let command = input.trim_start_matches("/switch ");
             match self.switch_to_identity(command) {
-                Ok(()) => {}, // Success message already sent by helper
+                Ok(()) => {} // Success message already sent by helper
                 Err(msg) => {
-                    self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+                    self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                        .unwrap();
                 }
             }
         } else if input.starts_with("/identity ") {
@@ -1517,7 +1750,8 @@ impl LeChatPHPClient {
             if rest == "list" {
                 if self.identities.is_empty() {
                     let msg = "No custom identities configured".to_string();
-                    self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+                    self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                        .unwrap();
                 } else {
                     let mut msg = "Configured identities:\n".to_string();
                     for (cmd, config) in &self.identities {
@@ -1525,7 +1759,8 @@ impl LeChatPHPClient {
                         let color = config.get(1).cloned().unwrap_or_else(|| "?".to_string());
                         msg.push_str(&format!("/{}: {} ({})\n", cmd, nickname, color));
                     }
-                    self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+                    self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                        .unwrap();
                 }
             } else if rest.starts_with("add ") {
                 let parts: Vec<&str> = rest.splitn(4, ' ').collect();
@@ -1537,31 +1772,38 @@ impl LeChatPHPClient {
                     let color = color.trim_matches('"').trim_matches('\'');
                     // Create a complete config: [nickname, color, incognito, bold, italic]
                     let config = vec![
-                        nickname.to_string(), 
-                        color.to_string(), 
-                        "false".to_string(),  // incognito
-                        "false".to_string(),  // bold
-                        "false".to_string()   // italic
+                        nickname.to_string(),
+                        color.to_string(),
+                        "false".to_string(), // incognito
+                        "false".to_string(), // bold
+                        "false".to_string(), // italic
                     ];
-                    
+
                     // Update in memory
                     self.identities.insert(command.to_string(), config);
-                    
+
                     // Save to config file
                     if let Ok(mut cfg) = confy::load::<MyConfig>("bhcli", None) {
                         if let Some(profile_cfg) = cfg.profiles.get_mut(&self.profile) {
-                            profile_cfg.identities.insert(command.to_string(), self.identities[command].clone());
+                            profile_cfg
+                                .identities
+                                .insert(command.to_string(), self.identities[command].clone());
                             if let Err(e) = confy::store("bhcli", None, cfg) {
                                 log::error!("failed to store config: {}", e);
                             } else {
-                                let msg = format!("Added identity /{}: {} ({})", command, nickname, color);
-                                self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+                                let msg = format!(
+                                    "Added identity /{}: {} ({})",
+                                    command, nickname, color
+                                );
+                                self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                                    .unwrap();
                             }
                         }
                     }
                 } else {
                     let msg = "Usage: /identity add <command> <nickname> <color>".to_string();
-                    self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+                    self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                        .unwrap();
                 }
             } else if rest.starts_with("remove ") {
                 let command = rest.trim_start_matches("remove ");
@@ -1574,26 +1816,35 @@ impl LeChatPHPClient {
                                 log::error!("failed to store config: {}", e);
                             } else {
                                 let msg = format!("Removed identity /{}", command);
-                                self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+                                self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                                    .unwrap();
                             }
                         }
                     }
                 } else {
                     let msg = format!("Identity /{} not found", command);
-                    self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+                    self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                        .unwrap();
                 }
             } else if rest.starts_with("switch ") {
                 let command = rest.trim_start_matches("switch ");
                 match self.switch_to_identity(command) {
-                    Ok(()) => {}, // Success message already sent by helper
+                    Ok(()) => {} // Success message already sent by helper
                     Err(msg) => {
-                        self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+                        self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                            .unwrap();
                     }
                 }
             } else {
                 let msg = "Usage: /identity list | add <command> <nickname> <color> | remove <command> | switch <command>".to_string();
-                self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+                self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                    .unwrap();
             }
+        } else if input.starts_with("/me ") {
+            // Handle /me commands - send as regular messages including the /me prefix
+            self.post_msg(PostType::Post(input.to_string(), target))
+                .unwrap();
+            return true;
         } else if input.starts_with('/') && input.contains(' ') {
             // Check for any unknown slash command that might be a custom identity
             if let Some(space_pos) = input.find(' ') {
@@ -1731,39 +1982,49 @@ Utility:
 /help - Show this help message
 
 Note: Some commands require appropriate permissions."#;
-            
+
             self.post_msg(PostType::Post(help_text.to_string(), Some("0".to_owned())))
                 .unwrap();
         } else if input == "/commands" {
             // List all ChatOps commands available to user
             let user_role = self.determine_user_role();
-            if let Some(chatops_result) = self.chatops_router.process_command("/list", &self.base_client.username, user_role) {
+            if let Some(chatops_result) =
+                self.chatops_router
+                    .process_command("/list", &self.base_client.username, user_role)
+            {
                 let messages = chatops_result.to_messages();
                 for message in messages {
-                    self.post_msg(PostType::Post(message, Some("0".to_owned()))).unwrap();
+                    self.post_msg(PostType::Post(message, Some("0".to_owned())))
+                        .unwrap();
                 }
             } else {
                 let msg = "ChatOps commands not available.".to_string();
-                self.post_msg(PostType::Post(msg, Some("0".to_owned()))).unwrap();
+                self.post_msg(PostType::Post(msg, Some("0".to_owned())))
+                    .unwrap();
             }
         } else if input == "/status" {
             let ai_enabled = *self.ai_enabled.lock().unwrap();
             let ai_mode = self.ai_mode.lock().unwrap().clone();
             let alt_forwarding = *self.alt_forwarding_enabled.lock().unwrap();
-            
-            let alt_account = self.alt_account.as_ref()
+
+            let alt_account = self
+                .account_manager.alt_account
+                .as_ref()
                 .map(|a| a.as_str())
                 .unwrap_or("(not set)");
-            let master_account = self.master_account.as_ref()
+            let master_account = self
+                .account_manager.master_account
+                .as_ref()
                 .map(|m| m.as_str())
                 .unwrap_or("(not set)");
-            
+
             let bad_usernames = self.bad_username_filters.lock().unwrap();
             let bad_exact_usernames = self.bad_exact_username_filters.lock().unwrap();
             let bad_messages = self.bad_message_filters.lock().unwrap();
             let allowlist = self.allowlist.lock().unwrap();
-            
-            let status_text = format!(r#"Current Status:
+
+            let status_text = format!(
+                r#"Current Status:
 
 Account Settings:
 - Username: {}
@@ -1803,41 +2064,73 @@ Connection:
                 alt_account,
                 master_account,
                 if alt_forwarding { "ON" } else { "OFF" },
-                
                 if ai_enabled { "YES" } else { "NO" },
                 ai_mode,
-                if self.system_intel.len() > 50 { 
-                    format!("{}...", &self.system_intel[..50]) 
-                } else { 
-                    self.system_intel.clone() 
+                if self.system_intel.len() > 50 {
+                    format!("{}...", &self.system_intel[..50])
+                } else {
+                    self.system_intel.clone()
                 },
                 self.moderation_strictness,
-                if *self.mod_logs_enabled.lock().unwrap() { "ON" } else { "OFF" },
-                
+                if *self.mod_logs_enabled.lock().unwrap() {
+                    "ON"
+                } else {
+                    "OFF"
+                },
                 if self.show_sys { "ON" } else { "OFF" },
                 if self.display_guest_view { "ON" } else { "OFF" },
-                if self.display_member_view { "ON" } else { "OFF" },
+                if self.display_member_view {
+                    "ON"
+                } else {
+                    "OFF"
+                },
                 if self.display_staff_view { "ON" } else { "OFF" },
-                if self.display_master_pm_view { "ON" } else { "OFF" },
+                if self.display_master_pm_view {
+                    "ON"
+                } else {
+                    "OFF"
+                },
                 if self.display_pm_only { "ON" } else { "OFF" },
-                if self.display_hidden_msgs { "ON" } else { "OFF" },
+                if self.display_hidden_msgs {
+                    "ON"
+                } else {
+                    "OFF"
+                },
                 if self.clean_mode { "ON" } else { "OFF" },
-                if *self.is_muted.lock().unwrap() { "YES" } else { "NO" },
-                
+                if *self.is_muted.lock().unwrap() {
+                    "YES"
+                } else {
+                    "NO"
+                },
                 bad_usernames.len(),
-                if bad_usernames.is_empty() { "(none)".to_string() } else { bad_usernames.join(", ") },
+                if bad_usernames.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    bad_usernames.join(", ")
+                },
                 bad_exact_usernames.len(),
-                if bad_exact_usernames.is_empty() { "(none)".to_string() } else { bad_exact_usernames.join(", ") },
+                if bad_exact_usernames.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    bad_exact_usernames.join(", ")
+                },
                 bad_messages.len(),
-                if bad_messages.is_empty() { "(none)".to_string() } else { bad_messages.join(", ") },
+                if bad_messages.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    bad_messages.join(", ")
+                },
                 allowlist.len(),
-                if allowlist.is_empty() { "(none)".to_string() } else { allowlist.join(", ") },
-                
+                if allowlist.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    allowlist.join(", ")
+                },
                 self.profile,
                 if self.session.is_some() { "YES" } else { "NO" },
                 self.refresh_rate
             );
-            
+
             self.post_msg(PostType::Post(status_text, Some("0".to_owned())))
                 .unwrap();
         } else {
@@ -1905,6 +2198,12 @@ Connection:
             }
             InputMode::MultilineEditing => {
                 self.handle_multiline_editing_mode_key_event(app, key_event, users)
+            }
+            InputMode::Notes => {
+                self.handle_notes_mode_key_event(app, key_event)
+            }
+            InputMode::MessageEditor => {
+                self.handle_message_editor_key_event(app, key_event, users)
             }
         }
     }
@@ -2188,7 +2487,9 @@ Connection:
                 code: KeyCode::Char('T'),
                 modifiers: KeyModifiers::SHIFT,
                 ..
-            } => self.handle_normal_mode_key_event_translate(app, messages),
+            } => {
+                app.enter_notes_mode(self);
+            }
             KeyEvent {
                 code: KeyCode::Char('u'),
                 modifiers: KeyModifiers::CONTROL,
@@ -2296,7 +2597,9 @@ Connection:
                 code: KeyCode::Char('x'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
-            } => self.handle_editing_mode_key_event_external_editor(app, users)?,
+            } => {
+                app.enter_message_editor_mode();
+            }
             KeyEvent {
                 code: KeyCode::Char('o'),
                 modifiers: KeyModifiers::CONTROL,
@@ -2508,7 +2811,7 @@ Connection:
                 if let Some(upload_link) = &item.upload_link {
                     let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
                     let mut out = format!("{}{}", self.config.url, upload_link);
-                    if let Some((_, _, msg)) = get_message(
+                    if let Some((_, _, msg, _)) = get_message(
                         &item.text,
                         &self.config.members_tag,
                         &self.config.staffs_tag,
@@ -2516,7 +2819,7 @@ Connection:
                         out = format!("{} {}", msg, out);
                     }
                     ctx.set_contents(out).unwrap();
-                } else if let Some((_, _, msg)) = get_message(
+                } else if let Some((_, _, msg, _)) = get_message(
                     &item.text,
                     &self.config.members_tag,
                     &self.config.staffs_tag,
@@ -2535,7 +2838,7 @@ Connection:
                     let mut ctx: ClipboardContext = ClipboardProvider::new().unwrap();
                     let out = format!("{}{}", self.config.url, upload_link);
                     ctx.set_contents(out).unwrap();
-                } else if let Some((_, _, msg)) = get_message(
+                } else if let Some((_, _, msg, _)) = get_message(
                     &item.text,
                     &self.config.members_tag,
                     &self.config.staffs_tag,
@@ -2569,7 +2872,7 @@ Connection:
                         .arg("download.img")
                         .output()
                         .expect("Failed to execute curl command");
-                } else if let Some((_, _, msg)) = get_message(
+                } else if let Some((_, _, msg, _)) = get_message(
                     &item.text,
                     &self.config.members_tag,
                     &self.config.staffs_tag,
@@ -2619,7 +2922,7 @@ Connection:
                         .arg("./download.img")
                         .output()
                         .expect("Failed to execute sxiv command");
-                } else if let Some((_, _, msg)) = get_message(
+                } else if let Some((_, _, msg, _)) = get_message(
                     &item.text,
                     &self.config.members_tag,
                     &self.config.staffs_tag,
@@ -2673,17 +2976,14 @@ Connection:
     }
 
     fn handle_normal_mode_key_event_toggle_v_view(&mut self) {
-        if self.master_account.is_some() {
+        if self.account_manager.master_account.is_some() {
             self.display_master_pm_view = !self.display_master_pm_view;
         } else {
             self.display_staff_view = !self.display_staff_view;
         }
     }
 
-    fn handle_normal_mode_key_event_shift_c(
-        &mut self,
-        app: &mut App,
-    ) {
+    fn handle_normal_mode_key_event_shift_c(&mut self, app: &mut App) {
         if self.clean_mode {
             self.clean_mode = false;
             return;
@@ -2711,11 +3011,7 @@ Connection:
             return;
         }
         if let Some(session) = &self.session {
-            match fetch_inbox_messages(
-                &self.client,
-                &self.config.url,
-                session,
-            ) {
+            match fetch_inbox_messages(&self.client, &self.config.url, session) {
                 Ok(msgs) => {
                     app.inbox_items.items = msgs;
                     app.inbox_items.state.select(None);
@@ -2762,7 +3058,7 @@ Connection:
                 &self.config.staffs_tag,
             ) {
                 let txt = text.text();
-                if let Some(master) = &self.master_account {
+                if let Some(master) = &self.account_manager.master_account {
                     if let Some((cmd, original)) =
                         parse_forwarded_username(&txt, &app.members_tag, &app.staffs_tag)
                     {
@@ -2805,7 +3101,7 @@ Connection:
     }
 
     fn handle_normal_mode_key_event_member_pm(&mut self, app: &mut App) {
-        if let Some(master) = &self.master_account {
+        if let Some(master) = &self.account_manager.master_account {
             app.input = format!("/pm {} /m ", master);
         } else {
             app.input = "/m ".to_owned();
@@ -2823,7 +3119,7 @@ Connection:
                 &self.config.members_tag,
                 &self.config.staffs_tag,
             ) {
-                if let Some(master) = &self.master_account {
+                if let Some(master) = &self.account_manager.master_account {
                     app.input = format!("/pm {} #kick {} ", master, username);
                 } else {
                     app.input = format!("/kick {} ", username);
@@ -2843,7 +3139,7 @@ Connection:
                 &self.config.members_tag,
                 &self.config.staffs_tag,
             ) {
-                if let Some(master) = &self.master_account {
+                if let Some(master) = &self.account_manager.master_account {
                     app.input = format!("/pm {} #ban {} ", master, username);
                 } else {
                     app.input = format!("/ban {} ", username);
@@ -2930,7 +3226,7 @@ Connection:
             // Handle deletion in inbox mode - delete all checked messages
             let mut indices_to_remove = Vec::new();
             let mut message_ids_to_delete = Vec::new();
-            
+
             for (idx, message) in app.inbox_items.items.iter().enumerate() {
                 if message.selected {
                     let message_id = message.id.clone();
@@ -2938,21 +3234,23 @@ Connection:
                     indices_to_remove.push(idx);
                 }
             }
-            
+
             // Remove messages from UI immediately
             for &idx in indices_to_remove.iter().rev() {
                 app.inbox_items.items.remove(idx);
             }
-            
+
             // Adjust selection
             if app.inbox_items.items.is_empty() {
                 app.inbox_items.state.select(None);
             } else if let Some(selected) = app.inbox_items.state.selected() {
                 if selected >= app.inbox_items.items.len() {
-                    app.inbox_items.state.select(Some(app.inbox_items.items.len() - 1));
+                    app.inbox_items
+                        .state
+                        .select(Some(app.inbox_items.items.len() - 1));
                 }
             }
-            
+
             // Send delete requests in background thread
             if !message_ids_to_delete.is_empty() {
                 let client = self.client.clone();
@@ -2968,7 +3266,7 @@ Connection:
                                 .text("session", session.clone())
                                 .text("do", "delete")
                                 .text("mid[]", message_id.clone());
-                            
+
                             if let Err(e) = client.post(&delete_url).multipart(form).send() {
                                 log::error!("Failed to delete inbox message {}: {}", message_id, e);
                             }
@@ -2978,12 +3276,12 @@ Connection:
             }
             return;
         }
-        
+
         if app.clean_mode {
             // Handle deletion in clean mode - delete all checked messages
             let mut indices_to_remove = Vec::new();
             let mut message_ids_to_delete = Vec::new();
-            
+
             for (idx, message) in app.clean_items.items.iter().enumerate() {
                 if message.selected {
                     let message_id = message.id.clone();
@@ -2991,21 +3289,23 @@ Connection:
                     indices_to_remove.push(idx);
                 }
             }
-            
+
             // Remove messages from UI immediately
             for &idx in indices_to_remove.iter().rev() {
                 app.clean_items.items.remove(idx);
             }
-            
+
             // Adjust selection
             if app.clean_items.items.is_empty() {
                 app.clean_items.state.select(None);
             } else if let Some(selected) = app.clean_items.state.selected() {
                 if selected >= app.clean_items.items.len() {
-                    app.clean_items.state.select(Some(app.clean_items.items.len() - 1));
+                    app.clean_items
+                        .state
+                        .select(Some(app.clean_items.items.len() - 1));
                 }
             }
-            
+
             // Send delete requests in background thread
             if !message_ids_to_delete.is_empty() {
                 let tx = self.tx.clone();
@@ -3013,14 +3313,18 @@ Connection:
                     for message_id in message_ids_to_delete {
                         let message_id_for_log = message_id.clone();
                         if let Err(e) = tx.send(PostType::Delete(message_id)) {
-                            log::error!("Failed to send delete request for message {}: {}", message_id_for_log, e);
+                            log::error!(
+                                "Failed to send delete request for message {}: {}",
+                                message_id_for_log,
+                                e
+                            );
                         }
                     }
                 });
             }
             return;
         }
-        
+
         // Regular message deletion
         if let Some(idx) = app.items.state.selected() {
             if let Some(id) = app.items.items.get(idx).and_then(|m| m.id) {
@@ -3100,7 +3404,7 @@ Connection:
         let mut members_prefix = false;
         let mut staffs_prefix = false;
         let mut pm_target: Option<String> = None;
-        
+
         // Check for /pm prefix first
         if let Some(captures) = PM_RGX.captures(&cmd_input) {
             let username = captures[1].to_string();
@@ -3282,14 +3586,21 @@ Connection:
         }
     }
 
-    fn handle_editing_mode_key_event_external_editor(&mut self, app: &mut App, users: &Arc<Mutex<Users>>) -> Result<(), ExitSignal> {
+    fn handle_editing_mode_key_event_external_editor(
+        &mut self,
+        app: &mut App,
+        users: &Arc<Mutex<Users>>,
+    ) -> Result<(), ExitSignal> {
+        use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+        use crossterm::{
+            execute,
+            terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+        };
         use std::fs;
+        use std::io::{stdout, Write};
         use std::process::{Command, Stdio};
         use tempfile::NamedTempFile;
-        use std::io::{stdout, Write};
-        use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-        use crossterm::{execute, terminal::{LeaveAlternateScreen, EnterAlternateScreen, Clear, ClearType}};
-        
+
         // Create a temporary file with .txt extension for better editor recognition
         let mut temp_file = match NamedTempFile::with_suffix(".txt") {
             Ok(file) => file,
@@ -3298,7 +3609,7 @@ Connection:
                 return Ok(());
             }
         };
-        
+
         // Write current input content to the temp file
         if !app.input.is_empty() {
             if let Err(e) = temp_file.write_all(app.input.as_bytes()) {
@@ -3310,7 +3621,7 @@ Connection:
                 return Ok(());
             }
         }
-        
+
         // Get the temp file path and keep temp_file alive
         let temp_path = match temp_file.path().to_str() {
             Some(path) => path.to_string(),
@@ -3319,45 +3630,49 @@ Connection:
                 return Ok(());
             }
         };
-        
+
         // Save the current input to restore if editor fails
         let original_input = app.input.clone();
         let original_input_idx = app.input_idx;
-        
+
         // Completely shut down the TUI application first
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), LeaveAlternateScreen, Clear(ClearType::All));
         let _ = stdout().flush();
-        
+
         // Print a clear message to the terminal
         println!("\n🚀 Launching external editor...\n");
-        
+
         // Determine which editor to use
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
             for editor in &["nvim", "vim", "nano", "vi"] {
-                if Command::new("which").arg(editor).output().map_or(false, |o| o.status.success()) {
+                if Command::new("which")
+                    .arg(editor)
+                    .output()
+                    .map_or(false, |o| o.status.success())
+                {
                     return editor.to_string();
                 }
             }
             "vi".to_string()
         });
-        
+
         // Launch the editor as a completely independent process
         // Give the editor complete control of the terminal
         let status = Command::new(&editor)
             .arg(&temp_path)
             .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit()) 
+            .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status();
-        
+
         // Editor has finished - immediately restart TUI without waiting for input
         // Editor has finished - immediately restart TUI without waiting for input
         println!("📝 Editor closed. Returning to chat...\n");
-        
+
         // Small delay to let user see the message
         std::thread::sleep(std::time::Duration::from_millis(500));
-        
+
         // Immediately restart the TUI - no user input required
         if let Err(e) = enable_raw_mode() {
             log::error!("Failed to re-enable raw mode: {}", e);
@@ -3365,7 +3680,7 @@ Connection:
         if let Err(e) = execute!(stdout(), EnterAlternateScreen) {
             log::error!("Failed to enter alternate screen: {}", e);
         }
-        
+
         // Force a complete screen refresh
         if let Err(e) = execute!(stdout(), Clear(ClearType::All)) {
             log::error!("Failed to clear screen: {}", e);
@@ -3373,7 +3688,7 @@ Connection:
         if let Err(e) = stdout().flush() {
             log::error!("Failed to flush stdout: {}", e);
         }
-        
+
         // Process the editor results
         match status {
             Ok(exit_status) if exit_status.success() => {
@@ -3381,19 +3696,21 @@ Connection:
                 match fs::read_to_string(&temp_path) {
                     Ok(content) => {
                         let content = content.trim_end().to_string();
-                        
+
                         if !content.is_empty() {
                             // Add to history if not empty
                             app.add_to_history(content.clone());
-                            
+
                             // Process and send the message directly
                             let mut processed_content = replace_newline_escape(&content);
-                            
+
                             // Check for commands and execute them
                             for (command, action) in &app.commands.commands {
                                 let expected_input = format!("!{}", command);
                                 if processed_content == expected_input {
-                                    if let Err(e) = self.post_msg(PostType::Post(action.clone(), None)) {
+                                    if let Err(e) =
+                                        self.post_msg(PostType::Post(action.clone(), None))
+                                    {
                                         log::error!("Failed to send command from editor: {}", e);
                                     }
                                     app.input.clear();
@@ -3402,28 +3719,31 @@ Connection:
                                     return Ok(());
                                 }
                             }
-                            
+
                             // Handle prefixes and process commands
                             let mut members_prefix = false;
                             let mut staffs_prefix = false;
                             let mut admin_prefix = false;
                             let mut pm_target: Option<String> = None;
-                            
+
                             // Check for /pm prefix first
                             if let Some(captures) = PM_RGX.captures(&processed_content) {
                                 pm_target = Some(captures[1].to_string());
                                 processed_content = captures[2].to_string();
                             } else if processed_content.starts_with("/m ") {
                                 members_prefix = true;
-                                processed_content = processed_content.strip_prefix("/m ").unwrap().to_string();
+                                processed_content =
+                                    processed_content.strip_prefix("/m ").unwrap().to_string();
                             } else if processed_content.starts_with("/s ") {
                                 staffs_prefix = true;
-                                processed_content = processed_content.strip_prefix("/s ").unwrap().to_string();
+                                processed_content =
+                                    processed_content.strip_prefix("/s ").unwrap().to_string();
                             } else if processed_content.starts_with("/a ") {
                                 admin_prefix = true;
-                                processed_content = processed_content.strip_prefix("/a ").unwrap().to_string();
+                                processed_content =
+                                    processed_content.strip_prefix("/a ").unwrap().to_string();
                             }
-                            
+
                             // Determine target for ChatOps commands
                             let chatops_target = if let Some(user) = pm_target.clone() {
                                 Some(user)
@@ -3438,7 +3758,12 @@ Connection:
                             };
 
                             // Try to process as ChatOps command
-                            if self.process_command_with_target(&processed_content, app, users, chatops_target.clone()) {
+                            if self.process_command_with_target(
+                                &processed_content,
+                                app,
+                                users,
+                                chatops_target.clone(),
+                            ) {
                                 // Command was processed successfully
                                 if let Some(user) = pm_target {
                                     app.input = format!("/pm {} ", user);
@@ -3459,41 +3784,56 @@ Connection:
                                 }
                                 return Ok(());
                             }
-                            
+
                             // Send as regular message with appropriate target
                             if let Some(user) = pm_target {
-                                if let Err(e) = self.post_msg(PostType::Post(processed_content, Some(user.clone()))) {
+                                if let Err(e) = self
+                                    .post_msg(PostType::Post(processed_content, Some(user.clone())))
+                                {
                                     log::error!("Failed to send PM from editor: {}", e);
                                 }
                                 app.input = format!("/pm {} ", user);
                                 app.input_idx = app.input.width();
                             } else if members_prefix {
-                                if let Err(e) = self.post_msg(PostType::Post(processed_content, Some(SEND_TO_MEMBERS.to_owned()))) {
+                                if let Err(e) = self.post_msg(PostType::Post(
+                                    processed_content,
+                                    Some(SEND_TO_MEMBERS.to_owned()),
+                                )) {
                                     log::error!("Failed to send message to members: {}", e);
                                 }
                                 app.input = "/m ".to_owned();
                                 app.input_idx = app.input.width();
                             } else if staffs_prefix {
-                                if let Err(e) = self.post_msg(PostType::Post(processed_content, Some(SEND_TO_STAFFS.to_owned()))) {
+                                if let Err(e) = self.post_msg(PostType::Post(
+                                    processed_content,
+                                    Some(SEND_TO_STAFFS.to_owned()),
+                                )) {
                                     log::error!("Failed to send message to staffs: {}", e);
                                 }
                                 app.input = "/s ".to_owned();
                                 app.input_idx = app.input.width();
                             } else if admin_prefix {
-                                if let Err(e) = self.post_msg(PostType::Post(processed_content, Some(SEND_TO_ADMINS.to_owned()))) {
+                                if let Err(e) = self.post_msg(PostType::Post(
+                                    processed_content,
+                                    Some(SEND_TO_ADMINS.to_owned()),
+                                )) {
                                     log::error!("Failed to send message to admins: {}", e);
                                 }
                                 app.input = "/a ".to_owned();
                                 app.input_idx = app.input.width();
                             } else {
-                                if processed_content.starts_with("/") && !processed_content.starts_with("/me ") {
+                                if processed_content.starts_with("/")
+                                    && !processed_content.starts_with("/me ")
+                                {
                                     // Invalid command - put it back in input with error state
                                     app.input = processed_content;
                                     app.input_idx = app.input.chars().count();
                                     app.input_mode = InputMode::EditingErr;
                                 } else {
                                     // Send as regular message
-                                    if let Err(e) = self.post_msg(PostType::Post(processed_content, None)) {
+                                    if let Err(e) =
+                                        self.post_msg(PostType::Post(processed_content, None))
+                                    {
                                         log::error!("Failed to send message from editor: {}", e);
                                     }
                                     app.input.clear();
@@ -3528,10 +3868,10 @@ Connection:
                 app.input_idx = original_input_idx;
             }
         }
-        
+
         // Ensure we're back in the correct state
         app.input_mode = InputMode::Editing;
-        
+
         Ok(())
     }
 
@@ -3590,12 +3930,12 @@ Connection:
         if app.input_mode == InputMode::MultilineEditing {
             let input = &app.input;
             let lines: Vec<&str> = input.split('\n').collect();
-            
+
             // Calculate which line the cursor is on
             let mut current_pos = 0;
             let mut cursor_line = 0;
             let mut chars_in_line = 0;
-            
+
             for (line_idx, line) in lines.iter().enumerate() {
                 let line_len = line.chars().count();
                 if current_pos + line_len >= app.input_idx {
@@ -3605,13 +3945,13 @@ Connection:
                 }
                 current_pos += line_len + 1; // +1 for newline
             }
-            
+
             // Try to move cursor to previous line
             if cursor_line > 0 {
                 let prev_line = lines[cursor_line - 1];
                 let prev_line_len = prev_line.chars().count();
                 let new_pos_in_line = chars_in_line.min(prev_line_len);
-                
+
                 // Calculate new cursor position
                 let mut new_cursor_pos = 0;
                 for i in 0..(cursor_line - 1) {
@@ -3624,7 +3964,7 @@ Connection:
                     new_cursor_pos += 1; // for newline before previous line
                 }
                 new_cursor_pos += new_pos_in_line;
-                
+
                 app.input_idx = new_cursor_pos;
             } else {
                 // At first line, try history navigation
@@ -3733,7 +4073,9 @@ Connection:
                 code: KeyCode::Char('x'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
-            } => self.handle_editing_mode_key_event_external_editor(app, users)?,
+            } => {
+                app.enter_message_editor_mode();
+            }
             KeyEvent {
                 code: KeyCode::Char('o'),
                 modifiers: KeyModifiers::CONTROL,
@@ -3804,12 +4146,12 @@ Connection:
         // Handle cursor navigation in multiline content
         let input = &app.input;
         let lines: Vec<&str> = input.split('\n').collect();
-        
+
         // Calculate which line the cursor is on
         let mut current_pos = 0;
         let mut cursor_line = 0;
         let mut chars_in_line = 0;
-        
+
         for (line_idx, line) in lines.iter().enumerate() {
             let line_len = line.chars().count();
             if current_pos + line_len >= app.input_idx {
@@ -3819,13 +4161,13 @@ Connection:
             }
             current_pos += line_len + 1; // +1 for newline
         }
-        
+
         // Try to move cursor to next line
         if cursor_line + 1 < lines.len() {
             let next_line = lines[cursor_line + 1];
             let next_line_len = next_line.chars().count();
             let new_pos_in_line = chars_in_line.min(next_line_len);
-            
+
             // Calculate new cursor position
             let mut new_cursor_pos = 0;
             for i in 0..=cursor_line {
@@ -3836,7 +4178,7 @@ Connection:
             }
             new_cursor_pos += 1; // for the newline between current and next line
             new_cursor_pos += new_pos_in_line;
-            
+
             app.input_idx = new_cursor_pos.min(input.chars().count());
         } else {
             // At last line, try history navigation
@@ -3862,6 +4204,144 @@ Connection:
         app.reset_history_navigation();
     }
 
+    fn handle_notes_mode_key_event(
+        &mut self,
+        app: &mut App,
+        key_event: KeyEvent,
+    ) -> Result<(), ExitSignal> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        match key_event {
+            KeyEvent {
+                code: KeyCode::Tab,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                app.cycle_notes_type(self);
+                Ok(())
+            }
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                if app.handle_notes_vim_key(c, self) {
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => {
+                // Handle capital letters and shifted characters
+                if app.handle_notes_vim_key(c, self) {
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Char('r'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                // Ctrl+r - redo
+                app.notes_redo();
+                Ok(())
+            }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                app.handle_notes_vim_key('\x08', self);
+                Ok(())
+            }
+            KeyEvent {
+                code: KeyCode::Delete,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                app.handle_notes_vim_key('\x7f', self);
+                Ok(())
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                app.handle_notes_vim_key('\n', self);
+                Ok(())
+            }
+            KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                app.handle_notes_vim_key('\x1b', self);
+                Ok(())
+            }
+            // Arrow keys for insert mode
+            KeyEvent {
+                code: KeyCode::Left,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                if app.notes_vim_mode == VimMode::Insert {
+                    if app.notes_cursor_pos.1 > 0 {
+                        app.notes_cursor_pos.1 -= 1;
+                    }
+                }
+                Ok(())
+            }
+            KeyEvent {
+                code: KeyCode::Right,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                if app.notes_vim_mode == VimMode::Insert {
+                    let line_len = app.notes_content[app.notes_cursor_pos.0].len();
+                    if app.notes_cursor_pos.1 < line_len {
+                        app.notes_cursor_pos.1 += 1;
+                    }
+                }
+                Ok(())
+            }
+            KeyEvent {
+                code: KeyCode::Up,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                if app.notes_vim_mode == VimMode::Insert && app.notes_cursor_pos.0 > 0 {
+                    app.notes_cursor_pos.0 -= 1;
+                    let line_len = app.notes_content[app.notes_cursor_pos.0].len();
+                    if app.notes_cursor_pos.1 > line_len {
+                        app.notes_cursor_pos.1 = line_len;
+                    }
+                }
+                Ok(())
+            }
+            KeyEvent {
+                code: KeyCode::Down,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                if app.notes_vim_mode == VimMode::Insert && app.notes_cursor_pos.0 < app.notes_content.len() - 1 {
+                    app.notes_cursor_pos.0 += 1;
+                    let line_len = app.notes_content[app.notes_cursor_pos.0].len();
+                    if app.notes_cursor_pos.1 > line_len {
+                        app.notes_cursor_pos.1 = line_len;
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn handle_mouse_event(
         &mut self,
         app: &mut App,
@@ -3873,6 +4353,83 @@ Connection:
             _ => {}
         }
         Ok(())
+    }
+
+    // Notes functionality
+    fn fetch_notes(&self, note_type: &str) -> Result<(Vec<String>, Option<String>), Box<dyn std::error::Error>> {
+        let session = self.session.as_ref().ok_or("Not logged in")?;
+        let full_url = format!("{}/{}", self.config.url, self.config.page_php);
+        
+        let mut params = vec![
+            ("action", "notes"),
+            ("session", session),
+            ("lang", LANG),
+        ];
+
+        if !note_type.is_empty() && note_type != "personal" {
+            params.push(("do", note_type));
+        }
+
+        let response = self.client.post(&full_url).form(&params).send()?;
+        let body = response.text()?;
+
+        // Parse HTML to extract textarea content and last edited info
+        let doc = select::document::Document::from(body.as_str());
+        
+        let content = if let Some(textarea) = doc.find(select::predicate::Name("textarea")).next() {
+            let content = textarea.text();
+            let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+            if lines.is_empty() {
+                vec!["".to_string()]
+            } else {
+                lines
+            }
+        } else {
+            vec!["Access denied or no notes found".to_string()]
+        };
+
+        // Extract last edited information from the paragraph before the form
+        let last_edited = doc
+            .find(select::predicate::Name("p"))
+            .filter_map(|node| {
+                let text = node.text();
+                // Look for text containing "Last edited by" pattern
+                if text.contains("Last edited by") || text.contains("at ") {
+                    Some(text.trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .next();
+
+        Ok((content, last_edited))
+    }
+
+    fn save_notes(&self, note_type: &str, content: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+        let session = self.session.as_ref().ok_or("Not logged in")?;
+        let full_url = format!("{}/{}", self.config.url, self.config.page_php);
+        
+        let text = content.join("\n");
+        let mut params = vec![
+            ("action", "notes"),
+            ("session", session),
+            ("lang", LANG),
+            ("text", text.as_str()),
+        ];
+
+        if !note_type.is_empty() && note_type != "personal" {
+            params.push(("do", note_type));
+        }
+
+        let response = self.client.post(&full_url).form(&params).send()?;
+        let body = response.text()?;
+
+        // Check if save was successful
+        if body.contains("Notes saved!") || body.contains("saved") {
+            Ok(())
+        } else {
+            Err("Failed to save notes".into())
+        }
     }
 }
 
@@ -4022,6 +4579,16 @@ fn post_msg(
                     ("sendto", send_to.unwrap_or(SEND_TO_ALL.to_owned())),
                 ]);
             }
+            PostType::PM(to, msg) => {
+                should_reset_keepalive_timer = true;
+                params.extend(vec![
+                    ("action", "post".to_owned()),
+                    ("postid", postid_value.to_owned()),
+                    ("multi", "on".to_owned()),
+                    ("message", format!("/pm {} {}", to, msg)),
+                    ("sendto", SEND_TO_ALL.to_owned()),
+                ]);
+            }
             PostType::KeepAlive(send_to) => {
                 should_reset_keepalive_timer = true;
                 delete_after = true;
@@ -4072,7 +4639,10 @@ fn post_msg(
                     ("timestamps", "on".to_owned()),
                     ("colour", new_color),
                     ("newnickname", new_nickname),
-                    ("incognito", if incognito_on { "on" } else { "off" }.to_owned()),
+                    (
+                        "incognito",
+                        if incognito_on { "on" } else { "off" }.to_owned(),
+                    ),
                     ("bold", if bold { "on" } else { "off" }.to_owned()),
                     ("italic", if italic { "on" } else { "off" }.to_owned()),
                 ]);
@@ -4188,6 +4758,181 @@ fn post_msg(
     }
 }
 
+impl LeChatPHPClient {
+    fn handle_message_editor_key_event(
+        &mut self,
+        app: &mut App,
+        key_event: KeyEvent,
+        users: &Arc<Mutex<Users>>,
+    ) -> Result<(), ExitSignal> {
+        let command = match key_event {
+            KeyEvent { code: KeyCode::Char('r'), modifiers: KeyModifiers::CONTROL, .. } => {
+                // Ctrl+r - redo
+                app.msg_editor_redo();
+                EditorCommand::None
+            }
+            KeyEvent { code: KeyCode::Char(c), modifiers: KeyModifiers::NONE, .. } => {
+                app.handle_msg_editor_vim_key(c)
+            }
+            KeyEvent { code: KeyCode::Char(c), modifiers: KeyModifiers::SHIFT, .. } => {
+                // Handle capital letters and shifted characters
+                app.handle_msg_editor_vim_key(c)
+            }
+            KeyEvent { code: KeyCode::Esc, .. } => app.handle_msg_editor_vim_key('\x1b'),
+            KeyEvent { code: KeyCode::Enter, .. } => app.handle_msg_editor_vim_key('\r'),
+            KeyEvent { code: KeyCode::Backspace, .. } => app.handle_msg_editor_vim_key('\x08'),
+            KeyEvent { code: KeyCode::Tab, .. } => app.handle_msg_editor_vim_key('\t'),
+            KeyEvent { code: KeyCode::Left, .. } => app.handle_msg_editor_vim_key('h'),
+            KeyEvent { code: KeyCode::Right, .. } => app.handle_msg_editor_vim_key('l'),
+            KeyEvent { code: KeyCode::Up, .. } => app.handle_msg_editor_vim_key('k'),
+            KeyEvent { code: KeyCode::Down, .. } => app.handle_msg_editor_vim_key('j'),
+            _ => EditorCommand::None,
+        };
+        
+        // Handle the command
+        match command {
+            EditorCommand::Send(content) => {
+                if !content.trim().is_empty() {
+                    // Process commands like /m, /s, /pm, and !commands
+                    self.process_message_editor_content(content, app, users)?;
+                }
+                // Reset input mode to Normal after sending message
+                app.input_mode = InputMode::Normal;
+                app.input.clear();
+                app.input_idx = 0;
+                Ok(())
+            }
+            EditorCommand::Quit => {
+                // Already handled by exit_message_editor_mode
+                Ok(())
+            }
+            EditorCommand::None => Ok(()),
+        }
+    }
+
+    fn process_message_editor_content(
+        &mut self,
+        content: String,
+        app: &mut App,
+        users: &Arc<Mutex<Users>>,
+    ) -> Result<(), ExitSignal> {
+        // Check for !commands first
+        for (command, action) in &app.commands.commands {
+            let expected_input = format!("!{}", command);
+            if content.trim() == expected_input {
+                if let Err(e) = self.post_msg(PostType::Post(action.clone(), None)) {
+                    log::error!("Failed to send command from message editor: {}", e);
+                }
+                return Ok(());
+            }
+        }
+
+        let mut processed_content = content;
+        let mut members_prefix = false;
+        let mut staffs_prefix = false;
+        let mut admin_prefix = false;
+        let mut pm_target: Option<String> = None;
+
+        // Check for /pm prefix first
+        if let Some(captures) = PM_RGX.captures(&processed_content) {
+            pm_target = Some(captures[1].to_string());
+            processed_content = captures[2].to_string();
+        } else if processed_content.starts_with("/m ") {
+            members_prefix = true;
+            processed_content = processed_content.strip_prefix("/m ").unwrap().to_string();
+        } else if processed_content.starts_with("/s ") {
+            staffs_prefix = true;
+            processed_content = processed_content.strip_prefix("/s ").unwrap().to_string();
+        } else if processed_content.starts_with("/a ") {
+            admin_prefix = true;
+            processed_content = processed_content.strip_prefix("/a ").unwrap().to_string();
+        }
+
+        // Determine target for ChatOps commands
+        let chatops_target = if let Some(user) = pm_target.clone() {
+            Some(user)
+        } else if members_prefix {
+            Some(SEND_TO_MEMBERS.to_owned())
+        } else if staffs_prefix {
+            Some(SEND_TO_STAFFS.to_owned())
+        } else {
+            None
+        };
+
+        // Check if it's a ChatOps command
+        if processed_content.starts_with("/") && !processed_content.starts_with("/me ") {
+            if self.process_command_with_target(&processed_content, app, users, chatops_target) {
+                // Command was processed successfully
+                if let Some(user) = pm_target {
+                    app.input = format!("/pm {} ", user);
+                    app.input_idx = app.input.width();
+                } else if members_prefix {
+                    app.input = "/m ".to_owned();
+                    app.input_idx = app.input.width();
+                } else if staffs_prefix {
+                    app.input = "/s ".to_owned();
+                    app.input_idx = app.input.width();
+                } else if admin_prefix {
+                    app.input = "/a ".to_owned();
+                    app.input_idx = app.input.width();
+                }
+                return Ok(());
+            }
+        }
+
+        // Send regular message with appropriate target
+        if let Some(user) = pm_target {
+            if let Err(e) = self.post_msg(PostType::Post(processed_content, Some(user.clone()))) {
+                log::error!("Failed to send PM from message editor: {}", e);
+            }
+            app.input = format!("/pm {} ", user);
+            app.input_idx = app.input.width();
+        } else if members_prefix {
+            if let Err(e) = self.post_msg(PostType::Post(
+                processed_content,
+                Some(SEND_TO_MEMBERS.to_owned()),
+            )) {
+                log::error!("Failed to send message to members from message editor: {}", e);
+            }
+            app.input = "/m ".to_owned();
+            app.input_idx = app.input.width();
+        } else if staffs_prefix {
+            if let Err(e) = self.post_msg(PostType::Post(
+                processed_content,
+                Some(SEND_TO_STAFFS.to_owned()),
+            )) {
+                log::error!("Failed to send message to staff from message editor: {}", e);
+            }
+            app.input = "/s ".to_owned();
+            app.input_idx = app.input.width();
+        } else if admin_prefix {
+            if let Err(e) = self.post_msg(PostType::Post(
+                processed_content,
+                Some(SEND_TO_ADMINS.to_owned()),
+            )) {
+                log::error!("Failed to send message to admins from message editor: {}", e);
+            }
+            app.input = "/a ".to_owned();
+            app.input_idx = app.input.width();
+        } else {
+            // Regular message to main chat
+            if processed_content.starts_with("/") && !processed_content.starts_with("/me ") {
+                // Invalid command - just send as regular message for now
+                if let Err(e) = self.post_msg(PostType::Post(processed_content, None)) {
+                    log::error!("Failed to send message from message editor: {}", e);
+                }
+            } else {
+                // Send as regular message
+                if let Err(e) = self.post_msg(PostType::Post(processed_content, None)) {
+                    log::error!("Failed to send message from message editor: {}", e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 fn parse_date(date: &str, datetime_fmt: &str) -> NaiveDateTime {
     let now = Utc::now();
     let date_fmt = format!("%Y-{}", datetime_fmt);
@@ -4228,6 +4973,8 @@ fn get_msgs(
     mod_logs_enabled: &Arc<Mutex<bool>>,
     ai_conversation_memory: &Arc<Mutex<std::collections::HashMap<String, Vec<(String, String)>>>>,
     user_warnings: &Arc<Mutex<std::collections::HashMap<String, u32>>>,
+    ai_service: &Arc<AIService>,
+    bot_manager: &Option<Arc<Mutex<BotManager>>>,
 ) -> anyhow::Result<()> {
     let url = format!(
         "{}/{}?action=view&session={}&lang={}",
@@ -4288,6 +5035,8 @@ fn get_msgs(
             ai_conversation_memory,
             user_warnings,
             master_account,
+            ai_service,
+            bot_manager,
         );
         // Build messages vector. Tag deleted messages.
         update_messages(
@@ -4336,6 +5085,8 @@ fn process_new_messages(
     ai_conversation_memory: &Arc<Mutex<std::collections::HashMap<String, Vec<(String, String)>>>>,
     user_warnings: &Arc<Mutex<std::collections::HashMap<String, u32>>>,
     master_account: Option<&str>,
+    ai_service: &Arc<AIService>,
+    bot_manager: &Option<Arc<Mutex<BotManager>>>,
 ) {
     if let Some(last_known_msg) = messages.first() {
         let last_known_msg_parsed_dt = parse_date(&last_known_msg.date, datetime_fmt);
@@ -4345,7 +5096,51 @@ fn process_new_messages(
         });
         for new_msg in filtered {
             log_chat_message(new_msg, username);
-            if let Some((from, to_opt, msg)) = get_message(&new_msg.text, members_tag, staffs_tag) {
+            if let Some((from, to_opt, msg, channel_info)) = get_message(&new_msg.text, members_tag, staffs_tag) {
+                // Track message in AI service for summarization and analysis
+                let chat_message = crate::ai_service::ChatMessage {
+                    author: from.clone(),
+                    content: msg.clone(),
+                    is_pm: to_opt.is_some(),
+                };
+                ai_service.add_message(chat_message);
+
+                // Process message through bot system if available
+                if let Some(bot_mgr) = bot_manager {
+                    if let Ok(manager) = bot_mgr.lock() {
+                        let _is_private = to_opt.is_some();
+
+                        // FIXED: Use actual channel information from message parsing
+                        let (channel_context, is_member) = if to_opt.is_some() {
+                            // Private message
+                            log::info!("Bot: Processing PM from {}", from);
+                            ("private", users.members.iter().any(|(_, name)| name == &from))
+                        } else {
+                            // Use the channel info parsed from the message structure
+                            let is_member = users.members.iter().any(|(_, name)| name == &from);
+                            let channel = channel_info.as_deref().unwrap_or("public");
+                            log::info!("Bot: Processing message from {} in channel: '{}' (member: {})", 
+                                from, channel, is_member);
+                            (channel, is_member)
+                        };
+                        
+                        if let Err(e) = manager.process_message_for_all_bots(
+                            &from,
+                            &msg,
+                            crate::bot_system::MessageType::Normal,
+                            new_msg.id.map(|id| id as u64),
+                            if channel_context == "public" {
+                                None
+                            } else {
+                                Some(channel_context)
+                            },
+                            is_member,
+                        ) {
+                            log::warn!("Failed to process message through bot system: {}", e);
+                        }
+                    }
+                }
+
                 // Notify when tagged
                 if msg.contains(format!("@{}", &username).as_str()) {
                     *should_notify = true;
@@ -4377,9 +5172,23 @@ fn process_new_messages(
                         } else if let Some(target) = msg.strip_prefix("#ban ") {
                             let user = target.trim().trim_start_matches('@');
                             if !user.is_empty() {
-                                let _ = tx.send(PostType::Kick(String::new(), user.to_owned()));
+                                // Always add to ban list
                                 let mut f = bad_usernames.lock().unwrap();
                                 f.push(user.to_owned());
+                                
+                                // Check if target is a member, staff, or admin - only kick guests
+                                let target_is_member = users.members.iter().any(|(_, n)| n == user)
+                                    || users.staff.iter().any(|(_, n)| n == user)
+                                    || users.admin.iter().any(|(_, n)| n == user);
+                                
+                                if target_is_member {
+                                    // Member banned but not kicked
+                                    let response = format!("@{} has been added to ban list (member not kicked)", user);
+                                    let _ = tx.send(PostType::Post(response, Some(from.clone())));
+                                } else {
+                                    // Guest banned and kicked
+                                    let _ = tx.send(PostType::Kick(String::new(), user.to_owned()));
+                                }
                             }
                         }
                     } else if directed_to_me && !has_permission {
@@ -4409,13 +5218,13 @@ fn process_new_messages(
                                 let _ = tx.send(PostType::Post(
                                     stripped.to_owned(),
                                     Some(SEND_TO_STAFFS.to_owned()),
-                            ));
-                            let confirm = format!("{}{} - {}", staffs_tag, username, stripped);
-                            let _ = tx.send(PostType::Post(confirm, Some(alt.to_owned())));
+                                ));
+                                let confirm = format!("{}{} - {}", staffs_tag, username, stripped);
+                                let _ = tx.send(PostType::Post(confirm, Some(alt.to_owned())));
+                            }
                         }
                     }
                 }
-            }
 
                 let is_guest = users.guests.iter().any(|(_, n)| n == &from);
                 if from != username && is_guest {
@@ -4424,9 +5233,16 @@ fn process_new_messages(
                         let allowed_users = allowlist.lock().unwrap();
                         allowed_users.contains(&from)
                     };
-                    
+
                     if is_allowed {
-                        send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: User '{}' is allowlisted, bypassing all filters", from));
+                        send_mod_log(
+                            tx,
+                            *mod_logs_enabled.lock().unwrap(),
+                            format!(
+                                "MOD LOG: User '{}' is allowlisted, bypassing all filters",
+                                from
+                            ),
+                        );
                     } else {
                         let bad_name = {
                             let filters = bad_usernames.lock().unwrap();
@@ -4453,36 +5269,46 @@ fn process_new_messages(
                             } else {
                                 "message filter match"
                             };
-                            send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: FILTER KICK - Kicking '{}' for {}: '{}'", from, reason, msg));
+                            send_mod_log(
+                                tx,
+                                *mod_logs_enabled.lock().unwrap(),
+                                format!(
+                                    "MOD LOG: FILTER KICK - Kicking '{}' for {}: '{}'",
+                                    from, reason, msg
+                                ),
+                            );
                             let _ = tx.send(PostType::Kick(String::new(), from.clone()));
                         } else {
                             let res = score_message(&msg);
                             if let Some(act) = action_from_score(res.score) {
-                            match act {
-                                Action::Warn => {
-                                    if to_opt.is_none() {
-                                        let reason = res
-                                            .reason
-                                            .map(|r| r.description())
-                                            .unwrap_or("breaking the rules");
-                                        let warn = format!(
+                                match act {
+                                    Action::Warn => {
+                                        if to_opt.is_none() {
+                                            let reason = res
+                                                .reason
+                                                .map(|r| r.description())
+                                                .unwrap_or("breaking the rules");
+                                            let warn = format!(
                                             "@{username} - @{from}'s message was flagged for {reason}."
                                         );
-                                        let _ = tx.send(PostType::Post(warn, Some("0".to_owned())));
+                                            let _ =
+                                                tx.send(PostType::Post(warn, Some("0".to_owned())));
+                                        }
+                                    }
+                                    Action::Kick => {
+                                        send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: HARM SCORE KICK - Kicking '{}' for message: '{}'", from, msg));
+                                        let _ =
+                                            tx.send(PostType::Kick(String::new(), from.clone()));
+                                    }
+                                    Action::Ban => {
+                                        send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: HARM SCORE BAN - Banning '{}' for message: '{}'", from, msg));
+                                        let _ =
+                                            tx.send(PostType::Kick(String::new(), from.clone()));
+                                        let mut f = bad_usernames.lock().unwrap();
+                                        f.push(from.clone());
                                     }
                                 }
-                                Action::Kick => {
-                                    send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: HARM SCORE KICK - Kicking '{}' for message: '{}'", from, msg));
-                                    let _ = tx.send(PostType::Kick(String::new(), from.clone()));
-                                }
-                                Action::Ban => {
-                                    send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: HARM SCORE BAN - Banning '{}' for message: '{}'", from, msg));
-                                    let _ = tx.send(PostType::Kick(String::new(), from.clone()));
-                                    let mut f = bad_usernames.lock().unwrap();
-                                    f.push(from.clone());
-                                }
                             }
-                        }
                         }
                     }
                 }
@@ -4491,7 +5317,7 @@ fn process_new_messages(
                 if *ai_enabled.lock().unwrap() && openai_client.is_some() && from != username {
                     // Check if user is a guest (not member, staff, or admin)
                     let is_guest = users.guests.iter().any(|(_, n)| n == &from);
-                    
+
                     let ai_mode_val = ai_mode.lock().unwrap().clone();
                     process_ai_message(
                         &from,
@@ -4527,58 +5353,98 @@ fn send_mod_log(tx: &crossbeam_channel::Sender<PostType>, mod_logs_enabled: bool
 // Function to check for specific violations that should trigger warnings in alt mode
 fn check_warning_violations(message: &str) -> Option<String> {
     let msg_lower = message.to_lowercase();
-    
+
     // Check for CP-related content
     let cp_patterns = [
-        "cheese pizza", "cp links", "young models", "trading cp", "pedo stuff", 
-        "kiddie porn", "jailbait", "preteen", "underage nudes", "r@ygold", 
-        "hussyfan", "ptsc", "pthc", "young boy", "young girl", "loli", "shota"
+        "cheese pizza",
+        "cp links",
+        "young models",
+        "trading cp",
+        "pedo stuff",
+        "kiddie porn",
+        "jailbait",
+        "preteen",
+        "underage nudes",
+        "r@ygold",
+        "hussyfan",
+        "ptsc",
+        "pthc",
+        "young boy",
+        "young girl",
+        "loli",
+        "shota",
     ];
-    
+
     for pattern in &cp_patterns {
         if msg_lower.contains(pattern) {
             return Some("inappropriate content involving minors".to_string());
         }
     }
-    
+
     // Check for pornography requests/sharing
     let porn_patterns = [
-        "send nudes", "porn links", "naked pics", "sex videos", "adult content", 
-        "xxx links", "porn site", "onlyfans", "cam girl", "webcam show"
+        "send nudes",
+        "porn links",
+        "naked pics",
+        "sex videos",
+        "adult content",
+        "xxx links",
+        "porn site",
+        "onlyfans",
+        "cam girl",
+        "webcam show",
     ];
-    
+
     for pattern in &porn_patterns {
         if msg_lower.contains(pattern) {
             return Some("inappropriate adult content".to_string());
         }
     }
-    
+
     // Check for gun/weapon purchases
     let gun_patterns = [
-        "buy gun", "selling gun", "purchase weapon", "buy ammo", "ammunition for sale",
-        "selling weapons", "firearm for sale", "gun dealer", "weapon trade", "buy rifle",
-        "selling pistol", "handgun for sale"
+        "buy gun",
+        "selling gun",
+        "purchase weapon",
+        "buy ammo",
+        "ammunition for sale",
+        "selling weapons",
+        "firearm for sale",
+        "gun dealer",
+        "weapon trade",
+        "buy rifle",
+        "selling pistol",
+        "handgun for sale",
     ];
-    
+
     for pattern in &gun_patterns {
         if msg_lower.contains(pattern) {
             return Some("attempting to buy/sell weapons".to_string());
         }
     }
-    
+
     // Check for account hacking services
     let hack_patterns = [
-        "hack facebook", "hack instagram", "hack account", "social media hack",
-        "password crack", "account recovery service", "hack someone", "breach account",
-        "steal password", "facebook hacker", "instagram hacker", "account takeover"
+        "hack facebook",
+        "hack instagram",
+        "hack account",
+        "social media hack",
+        "password crack",
+        "account recovery service",
+        "hack someone",
+        "breach account",
+        "steal password",
+        "facebook hacker",
+        "instagram hacker",
+        "account takeover",
     ];
-    
+
     for pattern in &hack_patterns {
         if msg_lower.contains(pattern) {
             return Some("offering/requesting account hacking services".to_string());
         }
     }
-    
+
     // Check for spam (excessive repetition)
     let words: Vec<&str> = message.split_whitespace().collect();
     if words.len() > 10 {
@@ -4587,14 +5453,14 @@ fn check_warning_violations(message: &str) -> Option<String> {
             return Some("spamming/excessive repetition".to_string());
         }
     }
-    
+
     // Check for excessive caps (more than 70% of message in caps)
     let caps_count = message.chars().filter(|c| c.is_uppercase()).count();
     let letter_count = message.chars().filter(|c| c.is_alphabetic()).count();
     if letter_count > 20 && caps_count as f32 / letter_count as f32 > 0.7 {
         return Some("excessive use of capital letters".to_string());
     }
-    
+
     None
 }
 
@@ -4625,11 +5491,11 @@ fn process_ai_message(
         // Check for @username at the start (first word)
         let first_word = msg_trimmed.split_whitespace().next().unwrap_or("");
         let starts_with_tag = first_word.starts_with('@') && first_word != format!("@{}", username);
-        
+
         // Check for @username at the end (last word)
         let last_word = msg_trimmed.split_whitespace().last().unwrap_or("");
         let ends_with_tag = last_word.starts_with('@') && last_word != format!("@{}", username);
-        
+
         starts_with_tag || ends_with_tag
     };
 
@@ -4649,15 +5515,29 @@ fn process_ai_message(
     // Check if we should do moderation based on mode and user status
     let should_do_moderation = match ai_mode {
         "off" => {
-            send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: AI disabled, skipping moderation for '{}': '{}'", from_user, msg_content));
-            false  // No moderation when completely off
-        },
+            send_mod_log(
+                tx,
+                *mod_logs_enabled.lock().unwrap(),
+                format!(
+                    "MOD LOG: AI disabled, skipping moderation for '{}': '{}'",
+                    from_user, msg_content
+                ),
+            );
+            false // No moderation when completely off
+        }
         _ => {
             if !is_guest {
-                send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: Skipping moderation for member/staff '{}': '{}'", from_user, msg_content));
-                false  // Don't moderate members, staff, or admins
+                send_mod_log(
+                    tx,
+                    *mod_logs_enabled.lock().unwrap(),
+                    format!(
+                        "MOD LOG: Skipping moderation for member/staff '{}': '{}'",
+                        from_user, msg_content
+                    ),
+                );
+                false // Don't moderate members, staff, or admins
             } else {
-                true   // Only moderate guests
+                true // Only moderate guests
             }
         }
     };
@@ -4673,27 +5553,39 @@ fn process_ai_message(
                     *count += 1;
                     *count
                 };
-                
-                send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), 
-                    format!("MOD LOG: WARNING {} for '{}' - {}: '{}'", warning_count, from_user, violation_reason, msg_content));
-                
+
+                send_mod_log(
+                    tx,
+                    *mod_logs_enabled.lock().unwrap(),
+                    format!(
+                        "MOD LOG: WARNING {} for '{}' - {}: '{}'",
+                        warning_count, from_user, violation_reason, msg_content
+                    ),
+                );
+
                 if warning_count >= 3 {
                     // Send kick command to master account via PM
                     let kick_msg = format!("#kick @{}", from_user);
                     let _ = tx.send(PostType::Post(kick_msg, Some(master.to_string())));
-                    
+
                     // Reset warning count after kick command
                     {
                         let mut warnings = user_warnings.lock().unwrap();
                         warnings.remove(&from_user);
                     }
-                    
-                    send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), 
-                        format!("MOD LOG: Sent kick command to master for '{}' after 3 warnings", from_user));
+
+                    send_mod_log(
+                        tx,
+                        *mod_logs_enabled.lock().unwrap(),
+                        format!(
+                            "MOD LOG: Sent kick command to master for '{}' after 3 warnings",
+                            from_user
+                        ),
+                    );
                     return; // Exit early
                 } else {
                     // Send warning to user
-                    let warning_msg = format!("@{} Warning {}/3: Please avoid {}. Further violations may result in removal.", 
+                    let warning_msg = format!("@{} Warning {}/3: Please avoid {}. Further violations may result in removal.",
                         from_user, warning_count, violation_reason);
                     let _ = tx.send(PostType::Post(warning_msg, None));
                     return; // Exit early, don't proceed with normal moderation
@@ -4704,12 +5596,30 @@ fn process_ai_message(
 
     // Do immediate quick moderation check first (synchronous and fast)
     if should_do_moderation {
-        send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: Checking guest message from '{}': '{}'", from_user, msg_content));
-        
+        send_mod_log(
+            tx,
+            *mod_logs_enabled.lock().unwrap(),
+            format!(
+                "MOD LOG: Checking guest message from '{}': '{}'",
+                from_user, msg_content
+            ),
+        );
+
         if let Some(should_moderate) = quick_moderation_check(&msg_content) {
             if should_moderate {
-                send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: QUICK PATTERN MATCH - Kicking '{}' for message: '{}'", from_user, msg_content));
-                log::warn!("IMMEDIATE KICK - Quick moderation flagged message from {}: {}", from_user, msg_content);
+                send_mod_log(
+                    tx,
+                    *mod_logs_enabled.lock().unwrap(),
+                    format!(
+                        "MOD LOG: QUICK PATTERN MATCH - Kicking '{}' for message: '{}'",
+                        from_user, msg_content
+                    ),
+                );
+                log::warn!(
+                    "IMMEDIATE KICK - Quick moderation flagged message from {}: {}",
+                    from_user,
+                    msg_content
+                );
                 // Kick immediately without waiting for AI processing
                 let _ = tx.send(PostType::Kick(String::new(), from_user.clone()));
                 let mut filters = bad_usernames.lock().unwrap();
@@ -4719,7 +5629,14 @@ fn process_ai_message(
                 send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: Quick patterns matched but flagged as false positive for '{}': '{}'", from_user, msg_content));
             }
         } else {
-            send_mod_log(tx, *mod_logs_enabled.lock().unwrap(), format!("MOD LOG: No quick patterns matched, sending to AI analysis for '{}': '{}'", from_user, msg_content));
+            send_mod_log(
+                tx,
+                *mod_logs_enabled.lock().unwrap(),
+                format!(
+                    "MOD LOG: No quick patterns matched, sending to AI analysis for '{}': '{}'",
+                    from_user, msg_content
+                ),
+            );
         }
     }
 
@@ -4753,7 +5670,7 @@ fn process_ai_message(
                 send_mod_log(&tx_clone, mod_logs_enabled_val, format!("MOD LOG: Skipping AI response - message from '{}' is directed at another user: '{}'", from_user, msg_content));
                 return;
             }
-            
+
             match ai_mode_owned.as_str() {
                 "mod_only" => {
                     // Only moderation, no responses - already handled above
@@ -4772,19 +5689,19 @@ fn process_ai_message(
                             history.remove(0);
                         }
                     }
-                    
+
                     if let Some(response) = generate_ai_response_with_memory(&client, &msg_content, &system_intel_owned, &username_owned, &memory_clone, &from_user).await {
                         // Calculate realistic delay based on response length
                         let delay_ms = calculate_realistic_delay(&response);
                         tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        
+
                         // Store AI response in memory
                         {
                             let mut memory = memory_clone.lock().unwrap();
                             let history = memory.entry(from_user.clone()).or_insert_with(Vec::new);
                             history.push(("assistant".to_string(), response.clone()));
                         }
-                        
+
                         // Tag the user we're replying to
                         let tagged_response = format!("@{} {}", from_user, response);
                         let _ = tx_clone.send(PostType::Post(tagged_response, None));
@@ -4793,7 +5710,7 @@ fn process_ai_message(
                 "reply_ping" => {
                     let is_mentioned = msg_content.contains(&format!("@{}", username_owned));
                     let is_directed = to_opt_clone.as_ref().map(|t| t == &username_owned).unwrap_or(false);
-                    
+
                     if is_mentioned || is_directed {
                         // Store user message in memory
                         {
@@ -4805,25 +5722,25 @@ fn process_ai_message(
                                 history.remove(0);
                             }
                         }
-                        
+
                         if let Some(response) = generate_ai_response_with_memory(&client, &msg_content, &system_intel_owned, &username_owned, &memory_clone, &from_user).await {
                             // Calculate realistic delay based on response length
                             let delay_ms = calculate_realistic_delay(&response);
                             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                            
+
                             // Store AI response in memory
                             {
                                 let mut memory = memory_clone.lock().unwrap();
                                 let history = memory.entry(from_user.clone()).or_insert_with(Vec::new);
                                 history.push(("assistant".to_string(), response.clone()));
                             }
-                            
+
                             // Tag the user we're replying to
                             let tagged_response = format!("@{} {}", from_user, response);
-                            let reply_target = if is_directed { 
-                                Some(from_user) 
-                            } else { 
-                                None 
+                            let reply_target = if is_directed {
+                                Some(from_user)
+                            } else {
+                                None
                             };
                             let _ = tx_clone.send(PostType::Post(tagged_response, reply_target));
                         }
@@ -4837,22 +5754,31 @@ fn process_ai_message(
 
 fn quick_moderation_check(message: &str) -> Option<bool> {
     let msg_lower = message.to_lowercase();
-    
+
     // Quick patterns for obvious violations (case insensitive)
     let illegal_request_patterns = [
-        "cheese pizza", "cp links", "young models",
-        "trading cp", "pedo stuff", "kiddie porn",
-        "jailbait", "preteen", "underage nudes",
-        "r@ygold", "hussyfan", "ptsc", "pthc"
+        "cheese pizza",
+        "cp links",
+        "young models",
+        "trading cp",
+        "pedo stuff",
+        "kiddie porn",
+        "jailbait",
+        "preteen",
+        "underage nudes",
+        "r@ygold",
+        "hussyfan",
+        "ptsc",
+        "pthc",
     ];
-    
+
     // Check for obvious illegal content requests
     for pattern in &illegal_request_patterns {
         if msg_lower.contains(pattern) {
             return Some(true); // Should moderate
         }
     }
-    
+
     // Check for excessive repetition (basic spam detection)
     let words: Vec<&str> = message.split_whitespace().collect();
     if words.len() > 10 {
@@ -4861,7 +5787,7 @@ fn quick_moderation_check(message: &str) -> Option<bool> {
             return Some(true); // Too repetitive, likely spam
         }
     }
-    
+
     // No quick violations found, need AI analysis
     None
 }
@@ -4922,18 +5848,14 @@ async fn check_ai_moderation(
     let request = CreateChatCompletionRequestArgs::default()
         .model("gpt-3.5-turbo")
         .messages([
-            ChatCompletionRequestMessage::System(
-                ChatCompletionRequestSystemMessage {
-                    content: ChatCompletionRequestSystemMessageContent::Text(system_prompt),
-                    name: None,
-                }
-            ),
-            ChatCompletionRequestMessage::User(
-                ChatCompletionRequestUserMessage {
-                    content: ChatCompletionRequestUserMessageContent::Text(message.to_string()),
-                    name: None,
-                }
-            ),
+            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                content: ChatCompletionRequestSystemMessageContent::Text(system_prompt),
+                name: None,
+            }),
+            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Text(message.to_string()),
+                name: None,
+            }),
         ])
         .max_tokens(10u16)
         .build();
@@ -4946,17 +5868,23 @@ async fn check_ai_moderation(
                         if let Some(content) = &choice.message.content {
                             let ai_response = content.trim().to_uppercase();
                             let should_moderate = ai_response == "YES";
-                            
+
                             // Enhanced logging for debugging
-                            log::info!("AI MODERATION DEBUG - Message: '{}' | AI Response: '{}' | Decision: {} | Strictness: {}", 
+                            log::info!("AI MODERATION DEBUG - Message: '{}' | AI Response: '{}' | Decision: {} | Strictness: {}",
                                 message, content.trim(), if should_moderate { "MODERATE" } else { "ALLOW" }, strictness);
-                            
+
                             return Some(should_moderate);
                         } else {
-                            log::error!("AI moderation: No content in response for message: '{}'", message);
+                            log::error!(
+                                "AI moderation: No content in response for message: '{}'",
+                                message
+                            );
                         }
                     } else {
-                        log::error!("AI moderation: No choices in response for message: '{}'", message);
+                        log::error!(
+                            "AI moderation: No choices in response for message: '{}'",
+                            message
+                        );
                     }
                 }
                 Err(e) => {
@@ -4965,7 +5893,11 @@ async fn check_ai_moderation(
             }
         }
         Err(e) => {
-            log::error!("AI moderation request build error for message '{}': {}", message, e);
+            log::error!(
+                "AI moderation request build error for message '{}': {}",
+                message,
+                e
+            );
         }
     }
     None
@@ -4988,38 +5920,44 @@ async fn generate_ai_response_with_memory(
     );
 
     // Build message history with context
-    let mut messages = vec![
-        ChatCompletionRequestMessage::System(
-            ChatCompletionRequestSystemMessage {
-                content: ChatCompletionRequestSystemMessageContent::Text(system_prompt),
-                name: None,
-            }
-        )
-    ];
-    
+    let mut messages = vec![ChatCompletionRequestMessage::System(
+        ChatCompletionRequestSystemMessage {
+            content: ChatCompletionRequestSystemMessageContent::Text(system_prompt),
+            name: None,
+        },
+    )];
+
     // Add conversation history for context
     {
         let memory = conversation_memory.lock().unwrap();
         if let Some(history) = memory.get(from_user) {
             // Add the last few messages for context (limit to avoid token overflow)
-            let recent_history = if history.len() > 8 { &history[history.len()-8..] } else { history };
+            let recent_history = if history.len() > 8 {
+                &history[history.len() - 8..]
+            } else {
+                history
+            };
             for (role, content) in recent_history {
                 match role.as_str() {
                     "user" => {
                         messages.push(ChatCompletionRequestMessage::User(
                             ChatCompletionRequestUserMessage {
-                                content: ChatCompletionRequestUserMessageContent::Text(content.clone()),
+                                content: ChatCompletionRequestUserMessageContent::Text(
+                                    content.clone(),
+                                ),
                                 name: Some(from_user.to_string()),
-                            }
+                            },
                         ));
                     }
                     "assistant" => {
                         messages.push(ChatCompletionRequestMessage::Assistant(
                             ChatCompletionRequestAssistantMessage {
-                                content: Some(ChatCompletionRequestAssistantMessageContent::Text(content.clone())),
+                                content: Some(ChatCompletionRequestAssistantMessageContent::Text(
+                                    content.clone(),
+                                )),
                                 name: Some(username.to_string()),
                                 ..Default::default()
-                            }
+                            },
                         ));
                     }
                     _ => {}
@@ -5027,13 +5965,13 @@ async fn generate_ai_response_with_memory(
             }
         }
     }
-    
+
     // Add the current message
     messages.push(ChatCompletionRequestMessage::User(
         ChatCompletionRequestUserMessage {
             content: ChatCompletionRequestUserMessageContent::Text(message.to_string()),
             name: Some(from_user.to_string()),
-        }
+        },
     ));
 
     let request = CreateChatCompletionRequestArgs::default()
@@ -5044,20 +5982,18 @@ async fn generate_ai_response_with_memory(
         .build();
 
     match request {
-        Ok(req) => {
-            match client.chat().create(req).await {
-                Ok(response) => {
-                    if let Some(choice) = response.choices.first() {
-                        if let Some(content) = &choice.message.content {
-                            return Some(content.trim().to_string());
-                        }
+        Ok(req) => match client.chat().create(req).await {
+            Ok(response) => {
+                if let Some(choice) = response.choices.first() {
+                    if let Some(content) = &choice.message.content {
+                        return Some(content.trim().to_string());
                     }
                 }
-                Err(e) => {
-                    log::error!("AI response error: {}", e);
-                }
             }
-        }
+            Err(e) => {
+                log::error!("AI response error: {}", e);
+            }
+        },
         Err(e) => {
             log::error!("AI request build error: {}", e);
         }
@@ -5068,22 +6004,22 @@ async fn generate_ai_response_with_memory(
 fn calculate_realistic_delay(response: &str) -> u64 {
     use rand::Rng;
     let mut rng = rand::thread_rng();
-    
+
     // Base delay for thinking time (3-8 seconds) - increased for more realistic pauses
     let base_delay = rng.gen_range(3000..8000);
-    
+
     // Typing speed simulation: 25-65 WPM (words per minute) - slower, more human-like
     // Average word length ~5 characters, so 125-325 characters per minute
     let chars_per_minute = rng.gen_range(125.0..325.0);
     let chars_per_ms = chars_per_minute / 60000.0; // Convert to chars per millisecond
-    
+
     let typing_delay = (response.len() as f64 / chars_per_ms) as u64;
-    
+
     // Add some random variance (±30%) - increased variance for more natural feel
     let total_delay = base_delay + typing_delay;
     let variance = (total_delay as f64 * 0.3) as u64;
     let final_delay = total_delay + rng.gen_range(0..variance) - (variance / 2);
-    
+
     // Cap the delay between 2-25 seconds to avoid being too slow but allow for longer responses
     final_delay.clamp(2000, 25000)
 }
@@ -5099,7 +6035,7 @@ fn update_messages(
 ) {
     let mut old_msg_ptr = 0;
     for mut new_msg in new_messages.into_iter() {
-        if let Some((from, Some(to), _)) = get_message(&new_msg.text, members_tag, staffs_tag) {
+        if let Some((from, Some(to), _, _)) = get_message(&new_msg.text, members_tag, staffs_tag) {
             if let Some(master) = master_account {
                 if to == master && from != master {
                     new_msg.hide = true;
@@ -5227,33 +6163,35 @@ fn fetch_clean_messages(
     ];
     let clean_resp_txt = client.post(&full_url).form(&params).send()?.text()?;
     let doc = Document::from(clean_resp_txt.as_str());
-    
+
     let mut messages = Vec::new();
-    
+
     // Parse the HTML for clean messages with checkboxes
     for div in doc.find(Attr("class", "msg")) {
         if let Some(checkbox) = div.find(Name("input")).next() {
             if let Some(value) = checkbox.attr("value") {
                 let message_id = value.to_string();
-                
+
                 // Extract the message content
                 let full_text = div.text();
-                
+
                 // Parse the date, sender, and content from the message
                 // Format varies in clean mode, try to extract what we can
                 if let Some(date_end) = full_text.find(" - ") {
                     let date = full_text[..date_end].trim().to_string();
                     let rest = &full_text[date_end + 3..];
-                    
+
                     // Try to extract username and content
                     let mut from = "Unknown".to_string();
                     let mut content = rest.to_string();
-                    
+
                     // Look for patterns like [username] or <username>
                     if let Some(bracket_start) = rest.find('[') {
                         if let Some(bracket_end) = rest.find(']') {
                             from = rest[bracket_start + 1..bracket_end].trim().to_string();
-                            content = rest[bracket_end + 1..].trim_start_matches(" - ").to_string();
+                            content = rest[bracket_end + 1..]
+                                .trim_start_matches(" - ")
+                                .to_string();
                         }
                     } else if let Some(angle_start) = rest.find('<') {
                         if let Some(angle_end) = rest.find('>') {
@@ -5267,13 +6205,8 @@ fn fetch_clean_messages(
                             content = rest[space_pos + 1..].to_string();
                         }
                     }
-                    
-                    messages.push(CleanMessage::new(
-                        message_id,
-                        date,
-                        from,
-                        content,
-                    ));
+
+                    messages.push(CleanMessage::new(message_id, date, from, content));
                 } else {
                     // Fallback for messages without clear date format
                     messages.push(CleanMessage::new(
@@ -5286,7 +6219,7 @@ fn fetch_clean_messages(
             }
         }
     }
-    
+
     Ok(messages)
 }
 
@@ -5296,45 +6229,42 @@ fn fetch_inbox_messages(
     session: &str,
 ) -> anyhow::Result<Vec<InboxMessage>> {
     let url = format!("{}?action=inbox&session={}", base_url, session);
-    
+
     let response = client.get(&url).send()?;
     let text = response.text()?;
-    
+
     let document = Document::from(text.as_str());
     let mut messages = Vec::new();
-    
+
     // Parse the HTML for inbox messages
     for div in document.find(Attr("class", "msg")) {
         if let Some(checkbox) = div.find(Name("input")).next() {
             if let Some(value) = checkbox.attr("value") {
                 let message_id = value.to_string();
-                
+
                 // Extract the message content
                 let full_text = div.text();
-                
+
                 // Parse the date, sender, recipient, and content from the message
                 // Format: "08-17 00:56:26 - [sender to recipient] - content"
                 if let Some(date_end) = full_text.find(" - ") {
                     let date = full_text[..date_end].trim().to_string();
                     let rest = &full_text[date_end + 3..];
-                    
+
                     if let Some(bracket_start) = rest.find('[') {
                         if let Some(bracket_end) = rest.find(']') {
                             let sender_info = &rest[bracket_start + 1..bracket_end];
-                            let content = rest[bracket_end + 1..].trim_start_matches(" - ").to_string();
-                            
+                            let content = rest[bracket_end + 1..]
+                                .trim_start_matches(" - ")
+                                .to_string();
+
                             // Parse "sender to recipient"
                             if let Some(to_pos) = sender_info.find(" to ") {
                                 let from = sender_info[..to_pos].trim().to_string();
                                 let to = sender_info[to_pos + 4..].trim().to_string();
-                                
-                                messages.push(InboxMessage::new(
-                                    message_id,
-                                    date,
-                                    from,
-                                    to,
-                                    content,
-                                ));
+
+                                messages
+                                    .push(InboxMessage::new(message_id, date, from, to, content));
                             }
                         }
                     }
@@ -5342,7 +6272,7 @@ fn fetch_inbox_messages(
             }
         }
     }
-    
+
     Ok(messages)
 }
 
@@ -5358,9 +6288,76 @@ impl ChatClient {
         c.config.datetime_fmt = params.datetime_fmt.unwrap_or("%m-%d %H:%M:%S".to_owned());
         c.config.members_tag = params.members_tag.unwrap_or("[M] ".to_owned());
         c.config.keepalive_send_to = params.keepalive_send_to.unwrap_or("0".to_owned());
-        // c.session = params.session;
+
         Self {
             le_chat_php_client: c,
+            bot_manager: None,
+        }
+    }
+
+    fn set_bot_manager(&mut self, bot_manager: Arc<Mutex<BotManager>>) {
+        self.le_chat_php_client.bot_manager = Some(bot_manager);
+    }
+
+    fn setup_bot_message_bridge(&mut self) {
+        if let Some(bot_mgr) = &self.le_chat_php_client.bot_manager {
+            let main_tx = self.le_chat_php_client.tx.clone();
+            let bot_mgr_clone = Arc::clone(bot_mgr);
+
+            // Get all bot receivers for message forwarding
+            let bot_receivers = if let Ok(manager) = bot_mgr_clone.lock() {
+                manager.get_all_bot_receivers()
+            } else {
+                Vec::new()
+            };
+
+            if !bot_receivers.is_empty() {
+                log::info!(
+                    "Setting up bot message bridge for {} bots",
+                    bot_receivers.len()
+                );
+
+                // Start a bridge thread to forward bot messages to main client
+                thread::spawn(move || {
+                    log::info!("Bot message bridge thread started");
+
+                    loop {
+                        let mut any_message = false;
+
+                        // Check messages from all bot receivers
+                        for (bot_name, rx) in &bot_receivers {
+                            if let Ok(receiver) = rx.try_lock() {
+                                // Try to receive messages from this bot
+                                while let Ok(bot_message) = receiver.try_recv() {
+                                    log::debug!(
+                                        "Bot '{}' message forwarded to main client",
+                                        bot_name
+                                    );
+
+                                    // Forward to main client
+                                    if let Err(e) = main_tx.try_send(bot_message) {
+                                        log::warn!(
+                                            "Failed to forward bot message to main client: {}",
+                                            e
+                                        );
+                                    } else {
+                                        any_message = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        // If no messages were processed, sleep a bit
+                        if !any_message {
+                            thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                });
+
+                log::info!("Bot message bridge setup completed");
+            } else {
+                log::warn!("No bot receivers found for message bridge");
+            }
         }
     }
 
@@ -5373,36 +6370,43 @@ fn new_default_le_chat_php_client(params: Params) -> LeChatPHPClient {
     let (color_tx, color_rx) = crossbeam_channel::unbounded();
     let (tx, rx) = crossbeam_channel::unbounded();
     let session = params.session.clone();
-    
+
     // Store original identity values before moving params
     let original_username = params.username.clone();
     let original_color = params.guest_color.clone();
-    
+    let username_for_manager = params.username.clone();
+
     // Load alt forwarding setting from config
     let alt_forwarding_enabled = if let Ok(cfg) = confy::load::<MyConfig>("bhcli", None) {
         cfg.alt_forwarding_enabled
     } else {
         true // Default to enabled
     };
-    
+
     // Initialize OpenAI client if API key is available
-    let openai_client = std::env::var("OPENAI_API_KEY")
-        .ok()
-        .map(|api_key| {
-            let config = OpenAIConfig::new().with_api_key(api_key);
-            OpenAIClient::with_config(config)
-        });
-    
+    let openai_client = std::env::var("OPENAI_API_KEY").ok().map(|api_key| {
+        let config = OpenAIConfig::new().with_api_key(api_key);
+        OpenAIClient::with_config(config)
+    });
+
+    // Initialize AI service and runtime
+    let ai_service = Arc::new(AIService::new());
+    let runtime = Arc::new(Runtime::new().expect("Failed to create tokio runtime"));
+
     // Load AI settings from profile or use defaults
-    let (ai_enabled, ai_mode, system_intel, moderation_strictness, mod_logs_enabled) = if let Ok(cfg) = confy::load::<MyConfig>("bhcli", None) {
+    let (ai_enabled, ai_mode, system_intel, moderation_strictness, mod_logs_enabled) = if let Ok(
+        cfg,
+    ) =
+        confy::load::<MyConfig>("bhcli", None)
+    {
         if let Some(profile_cfg) = cfg.profiles.get(&params.profile) {
             let mode = if profile_cfg.ai_mode == "mod" {
-                "mod_only".to_string()  // Convert old "mod" mode to "mod_only"
+                "mod_only".to_string() // Convert old "mod" mode to "mod_only"
             } else {
                 profile_cfg.ai_mode.clone()
             };
             (
-                profile_cfg.ai_enabled,  // Use the stored setting
+                profile_cfg.ai_enabled, // Use the stored setting
                 mode,
                 if profile_cfg.system_intel.is_empty() {
                     "You are a helpful AI assistant in a chat room. Be friendly and follow community guidelines.".to_string()
@@ -5410,15 +6414,27 @@ fn new_default_le_chat_php_client(params: Params) -> LeChatPHPClient {
                     profile_cfg.system_intel.clone()
                 },
                 profile_cfg.moderation_strictness.clone(),
-                profile_cfg.mod_logs_enabled
+                profile_cfg.mod_logs_enabled,
             )
         } else {
-            (params.ai_enabled, params.ai_mode, params.system_intel, "balanced".to_string(), true)
+            (
+                params.ai_enabled,
+                params.ai_mode,
+                params.system_intel,
+                "balanced".to_string(),
+                true,
+            )
         }
     } else {
-        (params.ai_enabled, params.ai_mode, params.system_intel, "balanced".to_string(), true)
+        (
+            params.ai_enabled,
+            params.ai_mode,
+            params.system_intel,
+            "balanced".to_string(),
+            true,
+        )
     };
-    
+
     // println!("session[2050] : {:?}",params.session);
     let mut client = LeChatPHPClient {
         base_client: BaseClient {
@@ -5448,8 +6464,16 @@ fn new_default_le_chat_php_client(params: Params) -> LeChatPHPClient {
         bad_exact_username_filters: Arc::new(Mutex::new(params.bad_exact_usernames)),
         bad_message_filters: Arc::new(Mutex::new(params.bad_messages)),
         allowlist: Arc::new(Mutex::new(params.allowlist)),
-        alt_account: params.alt_account,
-        master_account: params.master_account,
+        account_manager: {
+            let mut manager = AccountManager::new(username_for_manager);
+            if let Some(alt) = params.alt_account {
+                manager.set_alt_account(alt);
+            }
+            if let Some(master) = params.master_account {
+                manager.set_master_account(master);
+            }
+            manager
+        },
         profile: params.profile,
         display_pm_only: false,
         display_staff_view: false,
@@ -5468,17 +6492,26 @@ fn new_default_le_chat_php_client(params: Params) -> LeChatPHPClient {
         ai_conversation_memory: Arc::new(Mutex::new(std::collections::HashMap::new())),
         user_warnings: Arc::new(Mutex::new(std::collections::HashMap::new())),
         identities: params.identities,
-        chatops_router: ChatOpsRouter::new(),
+        chatops_router: if ai_service.is_available() {
+            ChatOpsRouter::new_with_ai(Arc::clone(&ai_service), Arc::clone(&runtime))
+        } else {
+            ChatOpsRouter::new()
+        },
+        ai_service: Arc::clone(&ai_service),
+        runtime: Arc::clone(&runtime),
+        bot_manager: None,
     };
-    
+
     // Initialize default identities
     client.ensure_default_identities();
-    
+
     client
 }
 
 struct ChatClient {
     le_chat_php_client: LeChatPHPClient,
+    #[allow(dead_code)]
+    bot_manager: Option<Arc<Mutex<BotManager>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -5640,31 +6673,30 @@ fn start_dkf_notifier(client: &Client, dkf_api_key: &str) {
     thread::spawn(move || {
         let (_stream, stream_handle) = OutputStream::try_default().unwrap();
         loop {
-
-        let params: Vec<(&str, String)> = vec![(
-            "last_known_date",
-            last_known_date.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        )];
-        let right_url = format!("{}/api/v1/chat/1/notifier", DKF_URL);
-        if let Ok(resp) = client
-            .post(right_url)
-            .form(&params)
-            .header("DKF_API_KEY", &dkf_api_key)
-            .send()
-        {
-            if let Ok(txt) = resp.text() {
-                if let Ok(v) = serde_json::from_str::<DkfNotifierResp>(&txt) {
-                    if v.pm_sound || v.tagged_sound {
-                        let source = Decoder::new_mp3(Cursor::new(SOUND1)).unwrap();
-                        stream_handle.play_raw(source.convert_samples()).unwrap();
+            let params: Vec<(&str, String)> = vec![(
+                "last_known_date",
+                last_known_date.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            )];
+            let right_url = format!("{}/api/v1/chat/1/notifier", DKF_URL);
+            if let Ok(resp) = client
+                .post(right_url)
+                .form(&params)
+                .header("DKF_API_KEY", &dkf_api_key)
+                .send()
+            {
+                if let Ok(txt) = resp.text() {
+                    if let Ok(v) = serde_json::from_str::<DkfNotifierResp>(&txt) {
+                        if v.pm_sound || v.tagged_sound {
+                            let source = Decoder::new_mp3(Cursor::new(SOUND1)).unwrap();
+                            stream_handle.play_raw(source.convert_samples()).unwrap();
+                        }
+                        last_known_date = DateTime::parse_from_rfc3339(&v.last_message_created_at)
+                            .unwrap()
+                            .with_timezone(&Utc);
                     }
-                    last_known_date = DateTime::parse_from_rfc3339(&v.last_message_created_at)
-                        .unwrap()
-                        .with_timezone(&Utc);
                 }
             }
-        }
-        thread::sleep(Duration::from_secs(5));
+            thread::sleep(Duration::from_secs(5));
         }
     });
 }
@@ -5830,27 +6862,91 @@ fn main() -> anyhow::Result<()> {
     };
     // println!("Session[2378]: {:?}", opts.session);
 
-    ChatClient::new(params).run_forever();
+    // Initialize bot system if bot parameter is provided
+    let bot_manager = if let Some(bot_name) = &opts.bot {
+        let ai_service = Arc::new(AIService::new());
+        let runtime = Arc::new(Runtime::new().expect("Failed to create tokio runtime"));
+
+        let mut bot_manager = BotManager::new(Some(ai_service), Some(runtime));
+
+        // Configure bot data directory
+        let _bot_data_dir = opts
+            .bot_data_dir
+            .clone()
+            .unwrap_or_else(|| format!("bot_data/{}", bot_name));
+
+        // Use same credentials as main client
+        let bot_url = params.url.clone().unwrap_or_else(|| {
+            "http://blkhatjxlrvc5aevqzz5t6kxldayog6jlx5h7glnu44euzongl4fh5ad.onion/index.php"
+                .to_string()
+        });
+
+        match bot_manager.add_bot(
+            bot_name.clone(),
+            params.username.clone(),
+            params.password.clone(),
+            bot_url,
+            opts.bot_admins.clone(),
+        ) {
+            Ok(_) => {
+                println!("🤖 Bot '{}' configured successfully", bot_name);
+
+                // Start the bot
+                if let Err(e) = bot_manager.start_bot(bot_name) {
+                    eprintln!("❌ Failed to start bot '{}': {}", bot_name, e);
+                } else {
+                    println!("🚀 Bot '{}' started and running in background", bot_name);
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to configure bot '{}': {}", bot_name, e);
+            }
+        }
+
+        Some(Arc::new(Mutex::new(bot_manager)))
+    } else {
+        None
+    };
+
+    // Pass bot_manager to ChatClient
+    let mut chat_client = ChatClient::new(params);
+    if let Some(bot_mgr) = &bot_manager {
+        chat_client.set_bot_manager(Arc::clone(bot_mgr));
+        // Create bridge between bot messages and main client
+        chat_client.setup_bot_message_bridge();
+    }
+    chat_client.run_forever();
+
+    // Clean up bot system when main client exits
+    if let Some(bot_mgr) = bot_manager {
+        println!("🔄 Shutting down bot system...");
+        if let Err(e) = bot_mgr.lock().unwrap().stop_all() {
+            eprintln!("⚠️ Error stopping bot system: {}", e);
+        } else {
+            println!("✅ Bot system stopped successfully");
+        }
+    }
 
     Ok(())
 }
 
 #[derive(Debug, Clone)]
 enum PostType {
-    Post(String, Option<String>),   // Message, SendTo
-    Kick(String, String),           // Message, Username
-    Upload(String, String, String), // FilePath, SendTo, Message
-    DeleteLast,                     // DeleteLast
-    Delete(String),                 // Delete message
-    DeleteAll,                      // DeleteAll
-    KeepAlive(String),              // SendTo for keepalive
-    NewNickname(String),            // NewUsername
-    NewColor(String),               // NewColor
-    Profile(String, String, bool, bool, bool),  // NewColor, NewUsername, Incognito, Bold, Italic
-    SetIncognito(bool),             // Set incognito mode on/off
-    Ignore(String),                 // Username
-    Unignore(String),               // Username
-    Clean(String, String),          // Clean message
+    Post(String, Option<String>),              // Message, SendTo
+    PM(String, String),                        // To, Message
+    Kick(String, String),                      // Message, Username
+    Upload(String, String, String),            // FilePath, SendTo, Message
+    DeleteLast,                                // DeleteLast
+    Delete(String),                            // Delete message
+    DeleteAll,                                 // DeleteAll
+    KeepAlive(String),                         // SendTo for keepalive
+    NewNickname(String),                       // NewUsername
+    NewColor(String),                          // NewColor
+    Profile(String, String, bool, bool, bool), // NewColor, NewUsername, Incognito, Bold, Italic
+    SetIncognito(bool),                        // Set incognito mode on/off
+    Ignore(String),                            // Username
+    Unignore(String),                          // Username
+    Clean(String, String),                     // Clean message
 }
 
 // Get username of other user (or ours if it's the only one)
@@ -5861,13 +6957,13 @@ fn get_username(
     staffs_tag: &str,
 ) -> Option<String> {
     match get_message(root, members_tag, staffs_tag) {
-        Some((from, Some(to), _)) => {
+        Some((from, Some(to), _, _)) => {
             if from == own_username {
                 return Some(to);
             }
             return Some(from);
         }
-        Some((from, None, _)) => {
+        Some((from, None, _, _)) => {
             return Some(from);
         }
         _ => return None,
@@ -5879,7 +6975,7 @@ fn get_message(
     root: &StyledText,
     members_tag: &str,
     staffs_tag: &str,
-) -> Option<(String, Option<String>, String)> {
+) -> Option<(String, Option<String>, String, Option<String>)> { // Added channel info
     if let StyledText::Styled(_, children) = root {
         let msg = children.get(0)?.text();
         match children.get(children.len() - 1)? {
@@ -5888,10 +6984,10 @@ fn get_message(
                     StyledText::Text(t) => t.to_owned(),
                     _ => return None,
                 };
-                return Some((from, None, msg));
+                return Some((from, None, msg, None)); // Public channel
             }
             StyledText::Text(t) => {
-                if t == &members_tag || t == &staffs_tag {
+                if t == &members_tag {
                     let from = match children.get(children.len() - 2)? {
                         StyledText::Styled(_, children) => {
                             match children.get(children.len() - 1)? {
@@ -5901,7 +6997,18 @@ fn get_message(
                         }
                         _ => return None,
                     };
-                    return Some((from, None, msg));
+                    return Some((from, None, msg, Some("members".to_string())));
+                } else if t == &staffs_tag {
+                    let from = match children.get(children.len() - 2)? {
+                        StyledText::Styled(_, children) => {
+                            match children.get(children.len() - 1)? {
+                                StyledText::Text(t) => t.to_owned(),
+                                _ => return None,
+                            }
+                        }
+                        _ => return None,
+                    };
+                    return Some((from, None, msg, Some("staff".to_string())));
                 } else if t == "[" {
                     let from = match children.get(children.len() - 2)? {
                         StyledText::Styled(_, children) => {
@@ -5921,7 +7028,7 @@ fn get_message(
                         }
                         _ => return None,
                     };
-                    return Some((from, to, msg));
+                    return Some((from, to, msg, None)); // Private message
                 }
             }
             _ => return None,
@@ -5969,12 +7076,12 @@ impl Message {
 
 #[derive(Debug, Clone)]
 struct InboxMessage {
-    id: String,       // message ID for deletion
-    date: String,     // formatted date string
-    from: String,     // sender username
-    to: String,       // recipient (usually "0" or username)
-    content: String,  // message content
-    selected: bool,   // for deletion selection
+    id: String,      // message ID for deletion
+    date: String,    // formatted date string
+    from: String,    // sender username
+    to: String,      // recipient (usually "0" or username)
+    content: String, // message content
+    selected: bool,  // for deletion selection
 }
 
 impl InboxMessage {
@@ -5992,12 +7099,12 @@ impl InboxMessage {
 
 #[derive(Debug, Clone)]
 struct CleanMessage {
-    id: String,       // message ID for deletion
-    date: String,     // formatted date string
+    id: String,   // message ID for deletion
+    date: String, // formatted date string
     #[allow(dead_code)]
-    from: String,     // sender username
-    content: String,  // message content
-    selected: bool,   // for deletion selection
+    from: String, // sender username
+    content: String, // message content
+    selected: bool, // for deletion selection
 }
 
 impl CleanMessage {
@@ -6114,7 +7221,9 @@ fn process_node(e: select::node::Node, mut color: tuiColor) -> (StyledText, Opti
                 Some("style") => {
                     return (StyledText::None, None);
                 }
-                Some("form") | Some("button") | Some("input") | Some("textarea") | Some("select") | Some("option") | Some("script") | Some("noscript") | Some("iframe") | Some("details") | Some("summary") | Some("label") => {
+                Some("form") | Some("button") | Some("input") | Some("textarea")
+                | Some("select") | Some("option") | Some("script") | Some("noscript")
+                | Some("iframe") | Some("details") | Some("summary") | Some("label") => {
                     // Strip out form elements and script elements that can break terminal rendering
                     return (StyledText::None, None);
                 }
@@ -6137,6 +7246,7 @@ fn process_node(e: select::node::Node, mut color: tuiColor) -> (StyledText, Opti
     }
 }
 
+#[derive(Clone)]
 struct Users {
     admin: Vec<(tuiColor, String)>,
     staff: Vec<(tuiColor, String)>,
@@ -6295,6 +7405,406 @@ fn extract_messages(doc: &Document) -> anyhow::Result<Vec<Message>> {
     Ok(msgs)
 }
 
+fn draw_notes_pane(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App) {
+    use tui::layout::{Constraint, Direction, Layout};
+    use tui::style::{Color, Modifier, Style};
+    use tui::text::{Span, Spans};
+    use tui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+
+    let size = f.size();
+    
+    // Clear the entire screen
+    f.render_widget(Clear, size);
+    
+    // Create main layout
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header
+            Constraint::Min(1),    // Content
+            Constraint::Length(3), // Status/command line
+        ])
+        .split(size);
+
+    // Header with note type and tabs
+    let current_type = app.get_current_notes_type();
+    let mut header_spans = vec![
+        Span::styled("Notes: ", Style::default().fg(Color::Yellow)),
+    ];
+    
+    for (i, note_type) in app.notes_available_types.iter().enumerate() {
+        if i == app.notes_type_index {
+            header_spans.push(Span::styled(
+                format!("[{}]", note_type),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            header_spans.push(Span::styled(
+                format!(" {} ", note_type),
+                Style::default().fg(Color::Gray),
+            ));
+        }
+        if i < app.notes_available_types.len() - 1 {
+            header_spans.push(Span::raw(" "));
+        }
+    }
+    header_spans.push(Span::raw(" | Tab to cycle | :w to save | :q to quit | :wq to save & quit"));
+
+    let header = Paragraph::new(Spans::from(header_spans))
+        .block(Block::default().borders(Borders::ALL).title("BHCLI Notes"))
+        .wrap(Wrap { trim: true });
+    f.render_widget(header, chunks[0]);
+
+    // Content area with text and scrolling support
+    let content_height = chunks[1].height.saturating_sub(2) as usize; // Account for borders
+    let visible_start = app.notes_scroll_offset;
+    let visible_end = std::cmp::min(visible_start + content_height, app.notes_content.len());
+    
+    let content_lines: Vec<Spans> = app.notes_content[visible_start..visible_end].iter().enumerate().map(|(visible_idx, line)| {
+        let line_idx = visible_start + visible_idx;
+        let mut spans = vec![];
+        
+        // Handle empty lines by showing at least a space with cursor if on this line
+        let display_line = if line.is_empty() && line_idx == app.notes_cursor_pos.0 {
+            " "
+        } else {
+            line
+        };
+        
+        // Determine if this line has visual selection
+        let has_visual_selection = app.notes_vim_mode == VimMode::Visual && 
+            app.notes_visual_start.is_some() &&
+            line_idx == app.notes_cursor_pos.0;
+        
+        for (col_idx, ch) in display_line.char_indices() {
+            let mut style = Style::default();
+            
+            // Cursor highlighting
+            if line_idx == app.notes_cursor_pos.0 {
+                if col_idx == app.notes_cursor_pos.1 {
+                    match app.notes_vim_mode {
+                        VimMode::Normal => {
+                            style = Style::default().bg(Color::Gray).fg(Color::Black);
+                        }
+                        VimMode::Insert => {
+                            style = Style::default().bg(Color::Yellow).fg(Color::Black);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            
+            // Visual selection highlighting
+            if has_visual_selection {
+                if let Some(start_pos) = app.notes_visual_start {
+                    let current_pos = (line_idx, col_idx);
+                    let selection_start = if start_pos <= app.notes_cursor_pos { start_pos } else { app.notes_cursor_pos };
+                    let selection_end = if start_pos <= app.notes_cursor_pos { app.notes_cursor_pos } else { start_pos };
+                    
+                    if current_pos >= selection_start && current_pos < selection_end {
+                        style = Style::default().bg(Color::Blue).fg(Color::White);
+                    }
+                }
+            }
+            
+            spans.push(Span::styled(ch.to_string(), style));
+        }
+        
+        // Add cursor at end of line if needed (for empty lines or when cursor is at end)
+        if line_idx == app.notes_cursor_pos.0 && app.notes_cursor_pos.1 >= line.len() {
+            match app.notes_vim_mode {
+                VimMode::Normal => {
+                    // Show cursor as highlighted space
+                    spans.push(Span::styled(" ", Style::default().bg(Color::Gray)));
+                }
+                VimMode::Insert => {
+                    // Show cursor as yellow pipe
+                    spans.push(Span::styled("|", Style::default().fg(Color::Yellow)));
+                }
+                _ => {}
+            }
+        }
+        
+        // For completely empty lines not at cursor position, add a fake space to show the line exists
+        if spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        
+        Spans::from(spans)
+    }).collect();
+
+    // Determine border color based on vim mode
+    let border_color = match app.notes_vim_mode {
+        VimMode::Insert => Color::LightBlue,
+        VimMode::Visual => Color::Green,
+        _ => Color::White,
+    };
+
+    let content_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(format!("{} Notes", current_type));
+    let content = Paragraph::new(content_lines)
+        .block(content_block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(content, chunks[1]);
+
+    // Status line
+    let status_text = if app.notes_search_mode {
+        format!("/{}", app.notes_search_query)
+    } else {
+        match app.notes_vim_mode {
+            VimMode::Normal => {
+                let modified = if app.notes_modified { " [modified]" } else { "" };
+                let last_edited = app.notes_last_edited.as_deref().unwrap_or("never");
+                let number_prefix = if let Some(ref prefix) = app.notes_number_prefix {
+                    format!("{}", prefix)
+                } else {
+                    String::new()
+                };
+                
+                let search_info = if let Some(current_idx) = app.notes_current_match_index {
+                    format!(" | Match ({}/{})", current_idx + 1, app.notes_search_matches.len())
+                } else {
+                    String::new()
+                };
+                
+                format!("-- NORMAL --{} | {}Line {}, Col {} | Last edited: {}{} | w/b:word $:end 0:start /{{pattern}}:search n/N:next/prev", 
+                        modified, 
+                        number_prefix,
+                        app.notes_cursor_pos.0 + 1, 
+                        app.notes_cursor_pos.1 + 1,
+                        last_edited,
+                        search_info)
+            }
+            VimMode::Insert => {
+                format!("-- INSERT -- | Line {}, Col {} | Use arrow keys or hjkl to navigate", 
+                        app.notes_cursor_pos.0 + 1, 
+                        app.notes_cursor_pos.1 + 1)
+            }
+            VimMode::Visual => {
+                let selection_info = if let Some(start) = app.notes_visual_start {
+                    format!(" | Selection: {}:{} to {}:{}", 
+                           start.0 + 1, start.1 + 1,
+                           app.notes_cursor_pos.0 + 1, app.notes_cursor_pos.1 + 1)
+                } else {
+                    String::new()
+                };
+                format!("-- VISUAL --{} | Press x to delete selection", selection_info)
+            }
+            VimMode::Command => {
+                format!(":{}", app.notes_vim_command)
+            }
+        }
+    };
+
+    let status = Paragraph::new(status_text)
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(status, chunks[2]);
+}
+
+fn draw_message_editor_ui(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App) {
+    use tui::layout::{Constraint, Direction, Layout};
+    use tui::style::{Color, Style};
+    use tui::text::{Span, Spans};
+    use tui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+
+    let size = f.size();
+    
+    // Clear the entire screen
+    f.render_widget(Clear, size);
+    
+    // Create main layout
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Header
+            Constraint::Min(1),    // Content
+            Constraint::Length(3), // Status/command line
+        ])
+        .split(size);
+
+    // Header
+    let header_text = Spans::from(vec![
+        Span::styled("Message Editor", Style::default().fg(Color::Yellow)),
+        Span::raw(" - Press :w to send, :q to cancel"),
+    ]);
+    let header = Paragraph::new(header_text)
+        .block(Block::default().borders(Borders::ALL).title("Editor"));
+    f.render_widget(header, chunks[0]);
+
+    // Determine border color based on mode
+    let border_color = match app.msg_editor_vim_mode {
+        VimMode::Insert => Color::LightBlue,
+        VimMode::Visual => Color::Green, 
+        _ => Color::White,
+    };
+
+    // Content area with scrolling
+    let content_height = chunks[1].height.saturating_sub(2) as usize; // Account for borders
+    
+    // Calculate visible content range based on cursor and scroll
+    let total_lines = app.msg_editor_content.len().max(1);
+    let cursor_line = app.msg_editor_cursor_pos.0;
+    
+    // Ensure cursor is visible
+    if cursor_line < app.msg_editor_scroll_offset {
+        app.msg_editor_scroll_offset = cursor_line;
+    } else if cursor_line >= app.msg_editor_scroll_offset + content_height {
+        app.msg_editor_scroll_offset = cursor_line.saturating_sub(content_height - 1);
+    }
+    
+    // Get visible lines - use same cursor logic as notes editor
+    let end_line = (app.msg_editor_scroll_offset + content_height).min(total_lines);
+    let visible_content: Vec<_> = app.msg_editor_content
+        .get(app.msg_editor_scroll_offset..end_line)
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let line_num = app.msg_editor_scroll_offset + i;
+            let mut spans = vec![];
+            
+            // Handle empty lines by showing at least a space with cursor if on this line
+            let display_line = if line.is_empty() && line_num == cursor_line {
+                " "
+            } else {
+                line
+            };
+            
+            // Determine if this line has visual selection
+            let has_visual_selection = app.msg_editor_vim_mode == VimMode::Visual && 
+                app.msg_editor_visual_start.is_some() &&
+                line_num == cursor_line;
+            
+            for (col_idx, ch) in display_line.char_indices() {
+                let mut style = Style::default();
+                
+                // Cursor highlighting
+                if line_num == cursor_line {
+                    if col_idx == app.msg_editor_cursor_pos.1 {
+                        match app.msg_editor_vim_mode {
+                            VimMode::Normal => {
+                                style = Style::default().bg(Color::Gray).fg(Color::Black);
+                            }
+                            VimMode::Insert => {
+                                style = Style::default().bg(Color::Yellow).fg(Color::Black);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                
+                // Visual selection highlighting
+                if has_visual_selection {
+                    if let Some((start_line, start_col)) = app.msg_editor_visual_start {
+                        let start_pos = (start_line, start_col);
+                        let current_pos = (line_num, col_idx);
+                        let selection_start = if start_pos <= app.msg_editor_cursor_pos { start_pos } else { app.msg_editor_cursor_pos };
+                        let selection_end = if start_pos <= app.msg_editor_cursor_pos { app.msg_editor_cursor_pos } else { start_pos };
+                        
+                        if current_pos >= selection_start && current_pos < selection_end {
+                            style = Style::default().bg(Color::Blue).fg(Color::White);
+                        }
+                    }
+                }
+                
+                spans.push(Span::styled(ch.to_string(), style));
+            }
+            
+            // Add cursor at end of line if needed (for empty lines or when cursor is at end)
+            if line_num == cursor_line && app.msg_editor_cursor_pos.1 >= line.len() {
+                match app.msg_editor_vim_mode {
+                    VimMode::Normal => {
+                        // Show cursor as highlighted space
+                        spans.push(Span::styled(" ", Style::default().bg(Color::Gray)));
+                    }
+                    VimMode::Insert => {
+                        // Show cursor as yellow pipe
+                        spans.push(Span::styled("|", Style::default().fg(Color::Yellow)));
+                    }
+                    _ => {}
+                }
+            }
+            
+            // For completely empty lines not at cursor position, add a fake space to show the line exists
+            if spans.is_empty() {
+                spans.push(Span::raw(" "));
+            }
+            
+            Spans::from(spans)
+        })
+        .collect();
+
+    let content = Paragraph::new(visible_content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Message")
+                .border_style(Style::default().fg(border_color))
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(content, chunks[1]);
+
+    // Status line
+    let status_text = if app.msg_editor_search_mode {
+        Spans::from(vec![
+            Span::styled(format!("/{}", app.msg_editor_search_query), Style::default().fg(Color::Cyan)),
+        ])
+    } else {
+        let mode_text = match app.msg_editor_vim_mode {
+            VimMode::Normal => "NORMAL",
+            VimMode::Insert => "INSERT", 
+            VimMode::Command => "COMMAND",
+            VimMode::Visual => "VISUAL",
+        };
+        
+        let number_prefix = if let Some(ref prefix) = app.msg_editor_number_prefix {
+            format!("{}", prefix)
+        } else {
+            String::new()
+        };
+        
+        match app.msg_editor_vim_mode {
+            VimMode::Normal => {
+                let search_info = if let Some(current_idx) = app.msg_editor_current_match_index {
+                    format!(" | Match ({}/{})", current_idx + 1, app.msg_editor_search_matches.len())
+                } else {
+                    String::new()
+                };
+                
+                Spans::from(vec![
+                    Span::styled(format!("-- {} --", mode_text), Style::default().fg(Color::Yellow)),
+                    Span::raw(format!(" | {}Cursor: {}:{} | Lines: {}{} | w/b:word $:end 0:start /{{pattern}}:search n/N:next/prev | :w to send, :q to cancel", 
+                             number_prefix,
+                             app.msg_editor_cursor_pos.0 + 1, 
+                             app.msg_editor_cursor_pos.1 + 1,
+                             app.msg_editor_content.len(),
+                             search_info)),
+                ])
+            }
+            VimMode::Command => {
+                Spans::from(vec![
+                    Span::styled(format!(":{}", app.msg_editor_vim_command), Style::default().fg(Color::Cyan)),
+                ])
+            }
+            _ => {
+                Spans::from(vec![
+                    Span::styled(format!("-- {} --", mode_text), Style::default().fg(Color::Yellow)),
+                    Span::raw(format!(" | Cursor: {}:{} | Lines: {} | :w to send, :q to cancel", 
+                             app.msg_editor_cursor_pos.0 + 1, 
+                             app.msg_editor_cursor_pos.1 + 1,
+                             app.msg_editor_content.len())),
+                ])
+            }
+        }
+    };
+    
+    let status = Paragraph::new(status_text)
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(status, chunks[2]);
+}
+
 fn draw_terminal_frame(
     f: &mut Frame<CrosstermBackend<io::Stdout>>,
     app: &mut App,
@@ -6302,6 +7812,16 @@ fn draw_terminal_frame(
     users: &Arc<Mutex<Users>>,
     username: &str,
 ) {
+    if app.notes_mode {
+        draw_notes_pane(f, app);
+        return;
+    }
+    
+    if app.msg_editor_mode {
+        draw_message_editor_ui(f, app);
+        return;
+    }
+    
     if app.long_message.is_none() {
         let hchunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -6312,7 +7832,7 @@ fn draw_terminal_frame(
             // Determine textbox height based on input mode
             let textbox_height = match app.input_mode {
                 InputMode::MultilineEditing => 8, // Larger height for multiline mode
-                _ => 3, // Default height for single-line modes
+                _ => 3,                           // Default height for single-line modes
             };
 
             let chunks = Layout::default()
@@ -6349,16 +7869,20 @@ fn draw_terminal_frame(
 
 fn gen_lines(msg_txt: &StyledText, w: usize, line_prefix: &str) -> Vec<Vec<(tuiColor, String)>> {
     let txt = msg_txt.text();
-    
+
     // For simple text (like help messages), use a much simpler approach
     // Check if this looks like plain text content (no HTML, just text with newlines)
-    let is_plain_text = !txt.contains('<') && !txt.contains('>') && 
-                       msg_txt.colored_text().iter().all(|(color, _)| *color == tuiColor::White);
-    
+    let is_plain_text = !txt.contains('<')
+        && !txt.contains('>')
+        && msg_txt
+            .colored_text()
+            .iter()
+            .all(|(color, _)| *color == tuiColor::White);
+
     if is_plain_text {
         // This is plain text, handle it simply
         let mut result = Vec::new();
-        
+
         // Split by existing newlines first to preserve intended line breaks
         for original_line in txt.split('\n') {
             if original_line.len() <= w {
@@ -6374,11 +7898,11 @@ fn gen_lines(msg_txt: &StyledText, w: usize, line_prefix: &str) -> Vec<Vec<(tuiC
         }
         return result;
     }
-    
+
     // Fallback to original complex logic for colored text
     let original_lines: Vec<&str> = txt.split('\n').collect();
     let mut wrapped_lines = Vec::new();
-    
+
     // Only wrap individual lines that are too long
     for line in original_lines {
         if line.len() <= w {
@@ -6391,8 +7915,11 @@ fn gen_lines(msg_txt: &StyledText, w: usize, line_prefix: &str) -> Vec<Vec<(tuiC
             }
         }
     }
-    
-    let splits = wrapped_lines.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
+
+    let splits = wrapped_lines
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<&str>>();
     let mut new_lines: Vec<Vec<(tuiColor, String)>> = Vec::new();
     let mut ctxt = msg_txt.colored_text();
     ctxt.reverse();
@@ -6477,7 +8004,7 @@ fn render_long_message(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut Ap
         // Calculate how many lines can be displayed in the available height
         let available_height = (r.height - 2) as usize; // -2 for borders
         let total_lines = rows.len();
-        
+
         // Adjust scroll offset to prevent scrolling beyond content
         let max_scroll = if total_lines > available_height {
             total_lines - available_height
@@ -6485,7 +8012,7 @@ fn render_long_message(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut Ap
             0
         };
         app.long_message_scroll_offset = app.long_message_scroll_offset.min(max_scroll);
-        
+
         // Apply scrolling by taking a slice of the rows
         let visible_rows = if total_lines > available_height {
             rows.into_iter()
@@ -6502,8 +8029,8 @@ fn render_long_message(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut Ap
             .collect();
 
         let title = if total_lines > available_height {
-            format!("Message (line {}/{}) - j/k or ↑/↓ to scroll, PgUp/PgDn for fast scroll, Enter/Esc to exit", 
-                    app.long_message_scroll_offset + 1, 
+            format!("Message (line {}/{}) - j/k or ↑/↓ to scroll, PgUp/PgDn for fast scroll, Enter/Esc to exit",
+                    app.long_message_scroll_offset + 1,
                     total_lines)
         } else {
             "Message - Enter/Esc to exit".to_string()
@@ -6561,6 +8088,8 @@ fn render_help_txt(
             ],
             Style::default(),
         ),
+        InputMode::Notes => (vec![], Style::default()),
+        InputMode::MessageEditor => (vec![], Style::default()),
     };
     msg.extend(vec![Span::raw(format!(" | {}", curr_user))]);
     if app.is_muted {
@@ -6633,7 +8162,7 @@ fn render_help_txt(
 fn render_textbox(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App, r: Rect) {
     let w = (r.width - 3) as usize;
     let str = app.input.clone();
-    
+
     // Handle multiline vs single line display differently
     let (input_widget, cursor_x, cursor_y) = match app.input_mode {
         InputMode::MultilineEditing => {
@@ -6641,29 +8170,33 @@ fn render_textbox(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App, r:
             let lines: Vec<&str> = str.split('\n').collect();
             let text_width = (r.width - 3) as usize; // Account for borders
             let available_height = (r.height - 2) as usize; // Account for borders
-            
+
             // Calculate total visual lines (including wrapped lines)
             let mut total_visual_lines = 0;
             let mut line_visual_counts = Vec::new();
             for line in &lines {
                 let line_len = line.chars().count();
-                let visual_count = if line_len == 0 { 1 } else { (line_len + text_width - 1) / text_width };
+                let visual_count = if line_len == 0 {
+                    1
+                } else {
+                    (line_len + text_width - 1) / text_width
+                };
                 line_visual_counts.push(visual_count);
                 total_visual_lines += visual_count;
             }
-            
+
             // Calculate which line the cursor is on and position within that line
             let mut cursor_line = 0;
             let mut chars_before_cursor = 0;
             let mut current_pos = 0;
             let mut cursor_visual_line = 0; // Track visual lines including wrapping
-            
+
             for (line_idx, line) in lines.iter().enumerate() {
                 let line_len = line.chars().count();
                 if current_pos + line_len >= app.input_idx {
                     cursor_line = line_idx;
                     chars_before_cursor = app.input_idx - current_pos;
-                    
+
                     // Calculate how many visual lines this cursor position creates due to wrapping
                     let chars_in_current_line = chars_before_cursor;
                     let wrapped_lines_before = chars_in_current_line / text_width;
@@ -6674,38 +8207,44 @@ fn render_textbox(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App, r:
                 current_pos += line_len + 1; // +1 for the newline character
                 cursor_visual_line += line_visual_counts[line_idx];
             }
-            
+
             // Ensure cursor is within bounds
             if cursor_line < lines.len() {
                 let current_line_len = lines[cursor_line].chars().count();
                 chars_before_cursor = chars_before_cursor.min(current_line_len % text_width);
             }
-            
+
             // Auto-scroll to keep cursor visible
             if cursor_visual_line < app.multiline_scroll_offset {
                 app.multiline_scroll_offset = cursor_visual_line;
             } else if cursor_visual_line >= app.multiline_scroll_offset + available_height {
                 app.multiline_scroll_offset = cursor_visual_line - available_height + 1;
             }
-            
+
             // Ensure scroll offset doesn't exceed content
             if total_visual_lines <= available_height {
                 app.multiline_scroll_offset = 0;
             } else {
-                app.multiline_scroll_offset = app.multiline_scroll_offset.min(total_visual_lines - available_height);
+                app.multiline_scroll_offset = app
+                    .multiline_scroll_offset
+                    .min(total_visual_lines - available_height);
             }
-            
+
             // Create the paragraph with proper line breaks and scrolling
             let input = Paragraph::new(str.as_str())
                 .style(Style::default().fg(tuiColor::Cyan))
-                .block(Block::default().borders(Borders::ALL).title("Input (Multiline)"))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Input (Multiline)"),
+                )
                 .wrap(Wrap { trim: false })
                 .scroll((app.multiline_scroll_offset as u16, 0));
-            
+
             // Calculate cursor position accounting for wrapping and scrolling
             let cursor_x = r.x + 1 + chars_before_cursor as u16;
             let cursor_y = r.y + 1 + (cursor_visual_line - app.multiline_scroll_offset) as u16;
-            
+
             (input, cursor_x, cursor_y)
         }
         _ => {
@@ -6716,7 +8255,7 @@ fn render_textbox(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App, r:
                 overflow = std::cmp::max(app.input.width() - w, 0);
                 input_str = &str[overflow..];
             }
-            
+
             let input = Paragraph::new(input_str)
                 .style(match app.input_mode {
                     InputMode::LongMessage => Style::default(),
@@ -6724,18 +8263,20 @@ fn render_textbox(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App, r:
                     InputMode::Editing => Style::default().fg(tuiColor::Yellow),
                     InputMode::EditingErr => Style::default().fg(tuiColor::Red),
                     InputMode::MultilineEditing => Style::default().fg(tuiColor::Cyan),
+                    InputMode::Notes => Style::default(),
+                    InputMode::MessageEditor => Style::default(),
                 })
                 .block(Block::default().borders(Borders::ALL).title("Input"));
-            
+
             let cursor_x = r.x + app.input_idx as u16 - overflow as u16 + 1;
             let cursor_y = r.y + 1;
-            
+
             (input, cursor_x, cursor_y)
         }
     };
-    
+
     f.render_widget(input_widget, r);
-    
+
     // Set cursor position based on input mode
     match app.input_mode {
         InputMode::LongMessage => {}
@@ -6744,6 +8285,8 @@ fn render_textbox(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App, r:
             // Make the cursor visible and position it correctly
             f.set_cursor(cursor_x, cursor_y);
         }
+        InputMode::Notes => {}
+        InputMode::MessageEditor => {}
     }
 }
 
@@ -6757,7 +8300,7 @@ fn render_messages(
         render_inbox_messages(f, app, r);
         return;
     }
-    
+
     // Messages
     app.items.items.clear();
     let messages = messages.lock().unwrap();
@@ -6770,68 +8313,70 @@ fn render_messages(
                 if !app.display_hidden_msgs && m.hide {
                     return None;
                 }
-            // Simulate a guest view (remove "PMs" and "Members chat" messages)
-            if app.display_guest_view {
-                // TODO: this is not efficient at all
-                let text = m.text.text();
-                if text.starts_with(&app.members_tag) || text.starts_with(&app.staffs_tag) {
-                    return None;
+                // Simulate a guest view (remove "PMs" and "Members chat" messages)
+                if app.display_guest_view {
+                    // TODO: this is not efficient at all
+                    let text = m.text.text();
+                    if text.starts_with(&app.members_tag) || text.starts_with(&app.staffs_tag) {
+                        return None;
+                    }
+                    if let Some((_, Some(_), _, _)) =
+                        get_message(&m.text, &app.members_tag, &app.staffs_tag)
+                    {
+                        return None;
+                    }
                 }
-                if let Some((_, Some(_), _)) =
-                    get_message(&m.text, &app.members_tag, &app.staffs_tag)
-                {
-                    return None;
-                }
-            }
 
-            // Strange
-            // Display only messages from members and staff
-            if app.display_member_view {
-                // In members mode, include only messages from members and staff
-                let text = m.text.text();
-                if !text.starts_with(&app.members_tag) && !text.starts_with(&app.staffs_tag) {
-                    return None;
+                // Strange
+                // Display only messages from members and staff
+                if app.display_member_view {
+                    // In members mode, include only messages from members and staff
+                    let text = m.text.text();
+                    if !text.starts_with(&app.members_tag) && !text.starts_with(&app.staffs_tag) {
+                        return None;
+                    }
+                    if let Some((_, Some(_), _, _)) =
+                        get_message(&m.text, &app.members_tag, &app.staffs_tag)
+                    {
+                        return None;
+                    }
                 }
-                if let Some((_, Some(_), _)) =
-                    get_message(&m.text, &app.members_tag, &app.staffs_tag)
-                {
-                    return None;
-                }
-            }
 
-            if app.display_pm_only {
-                match get_message(&m.text, &app.members_tag, &app.staffs_tag) {
-                    Some((_, Some(_), _)) => {}
-                    _ => return None,
-                }
-            }
-
-            if app.display_staff_view {
-                let text = m.text.text();
-                if !text.starts_with(&app.staffs_tag) {
-                    return None;
-                }
-            }
-
-            if app.display_master_pm_view {
-                if let Some(master) = &app.master_account {
+                if app.display_pm_only {
                     match get_message(&m.text, &app.members_tag, &app.staffs_tag) {
-                        Some((from, Some(_), _)) if from == *master => {}
+                        Some((_, Some(_), _, _)) => {}
                         _ => return None,
                     }
                 }
-            }
 
-            if app.filter != "" {
-                if !m
-                    .text
-                    .text()
-                    .to_lowercase()
-                    .contains(&app.filter.to_lowercase())
-                {
-                    return None;
+                if app.display_staff_view {
+                    let text = m.text.text();
+                    if !text.starts_with(&app.staffs_tag) {
+                        return None;
+                    }
                 }
-            }
+
+                if app.display_master_pm_view {
+                    // Master PM view filtering is now handled by client-level account manager
+                    // This view mode is only enabled when master account is configured
+                    match get_message(&m.text, &app.members_tag, &app.staffs_tag) {
+                        Some((_, Some(_), _, _)) => {
+                            // Show PMs when in master PM view mode
+                        }
+                        _ => return None,
+                    }
+                }
+
+                if app.filter != "" {
+                    if !m
+                        .text
+                        .text()
+                        .to_lowercase()
+                        .contains(&app.filter.to_lowercase())
+                    {
+                        return None;
+                    }
+                }
             }
 
             app.items.items.push(m.clone());
@@ -6884,23 +8429,30 @@ fn render_messages(
     f.render_stateful_widget(messages_list, r, &mut app.items.state)
 }
 
-fn render_inbox_messages(
-    f: &mut Frame<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-    r: Rect,
-) {
-    let messages_list_items: Vec<ListItem> = app.inbox_items.items
+fn render_inbox_messages(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App, r: Rect) {
+    let messages_list_items: Vec<ListItem> = app
+        .inbox_items
+        .items
         .iter()
         .map(|m| {
             let date_style = Style::default().fg(tuiColor::DarkGray);
             let from_style = Style::default().fg(tuiColor::LightBlue);
             let to_style = Style::default().fg(tuiColor::White);
             let content_style = Style::default().fg(tuiColor::White);
-            let selected_style = Style::default().fg(tuiColor::Red).add_modifier(Modifier::BOLD);
-            
+            let selected_style = Style::default()
+                .fg(tuiColor::Red)
+                .add_modifier(Modifier::BOLD);
+
             let checkbox = if m.selected { "[X]" } else { "[ ]" };
-            let checkbox_span = Span::styled(checkbox, if m.selected { selected_style } else { Style::default() });
-            
+            let checkbox_span = Span::styled(
+                checkbox,
+                if m.selected {
+                    selected_style
+                } else {
+                    Style::default()
+                },
+            );
+
             let spans = vec![
                 checkbox_span,
                 Span::raw(" "),
@@ -6912,7 +8464,7 @@ fn render_inbox_messages(
                 Span::raw("] - "),
                 Span::styled(&m.content, content_style),
             ];
-            
+
             ListItem::new(Spans::from(spans))
         })
         .collect();
@@ -6927,21 +8479,28 @@ fn render_inbox_messages(
     f.render_stateful_widget(messages_list, r, &mut app.inbox_items.state)
 }
 
-fn render_clean_messages(
-    f: &mut Frame<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-    r: Rect,
-) {
-    let messages_list_items: Vec<ListItem> = app.clean_items.items
+fn render_clean_messages(f: &mut Frame<CrosstermBackend<io::Stdout>>, app: &mut App, r: Rect) {
+    let messages_list_items: Vec<ListItem> = app
+        .clean_items
+        .items
         .iter()
         .map(|m| {
             let date_style = Style::default().fg(tuiColor::DarkGray);
             let content_style = Style::default().fg(tuiColor::White);
-            let selected_style = Style::default().fg(tuiColor::Red).add_modifier(Modifier::BOLD);
-            
+            let selected_style = Style::default()
+                .fg(tuiColor::Red)
+                .add_modifier(Modifier::BOLD);
+
             let checkbox = if m.selected { "[X]" } else { "[ ]" };
-            let checkbox_span = Span::styled(checkbox, if m.selected { selected_style } else { Style::default() });
-            
+            let checkbox_span = Span::styled(
+                checkbox,
+                if m.selected {
+                    selected_style
+                } else {
+                    Style::default()
+                },
+            );
+
             let spans = vec![
                 checkbox_span,
                 Span::raw(" "),
@@ -6949,18 +8508,21 @@ fn render_clean_messages(
                 Span::raw(" - "),
                 Span::styled(&m.content, content_style),
             ];
-            
+
             ListItem::new(Spans::from(spans))
         })
         .collect();
 
-    let messages_list = List::new(messages_list_items)
-        .block(Block::default().borders(Borders::ALL).title("Clean Mode (Shift+C to toggle, Space to check/uncheck, 'x' to delete checked)"))
-        .highlight_style(
-            Style::default()
-                .bg(tuiColor::Rgb(50, 50, 50))
-                .add_modifier(Modifier::BOLD),
-        );
+    let messages_list =
+        List::new(messages_list_items)
+            .block(Block::default().borders(Borders::ALL).title(
+                "Clean Mode (Shift+C to toggle, Space to check/uncheck, 'x' to delete checked)",
+            ))
+            .highlight_style(
+                Style::default()
+                    .bg(tuiColor::Rgb(50, 50, 50))
+                    .add_modifier(Modifier::BOLD),
+            );
     f.render_stateful_widget(messages_list, r, &mut app.clean_items.state)
 }
 
@@ -6996,12 +8558,29 @@ enum InputMode {
     Editing,
     EditingErr,
     MultilineEditing,
+    Notes,
+    MessageEditor,
+}
+
+#[derive(PartialEq, Clone)]
+enum VimMode {
+    Normal,
+    Insert,
+    Command,
+    Visual,
+}
+
+#[derive(Debug)]
+enum EditorCommand {
+    Send(String),
+    Quit,
+    None,
 }
 
 /// App holds the state of the application
 struct App {
     /// Current value of the input box
-    struct App {
+    input: String,
     input_idx: usize,
     /// Current input mode
     input_mode: InputMode,
@@ -7024,25 +8603,66 @@ struct App {
     long_message_scroll_offset: usize,
     commands: Commands,
 
-    alt_account: Option<String>,
-    master_account: Option<String>,
     display_pm_only: bool,
     display_staff_view: bool,
     display_master_pm_view: bool,
     clean_mode: bool,
     inbox_mode: bool,
-    
+
     // Multiline input scrolling
     multiline_scroll_offset: usize,
-    
+
     // External editor state
     external_editor_active: bool,
+
+    // Formatting state for current identity
+    #[allow(dead_code)]
+    bold: bool,
+    #[allow(dead_code)]
+    italic: bool,
+
+    // Notes pane state
+    notes_mode: bool,
+    notes_vim_mode: VimMode,
+    notes_cursor_pos: (usize, usize), // (line, col)
+    notes_content: Vec<String>,
+    notes_type_index: usize, // 0=Personal, 1=Public, 2=Staff, 3=Admin
+    notes_available_types: Vec<&'static str>,
+    notes_vim_command: String,
+    notes_modified: bool,
+    notes_scroll_offset: usize,
+    notes_visual_start: Option<(usize, usize)>, // Visual mode selection start
+    notes_last_edited: Option<String>, // Last edited timestamp
+    notes_pending_g: bool, // For gg/G commands
+    notes_number_prefix: Option<String>, // For number prefixes like 12j
+    notes_search_query: String, // For /{filter} searches
+    notes_search_mode: bool, // Whether we're in search mode
+    notes_search_matches: Vec<(usize, usize)>, // All search match positions (line, col)
+    notes_current_match_index: Option<usize>, // Current match index
+    notes_pending_d: bool, // For dd line deletion (waiting for second d)
+    notes_undo_history: Vec<Vec<String>>, // History of content states for undo
+    notes_undo_cursor_history: Vec<(usize, usize)>, // History of cursor positions
+    notes_undo_index: usize, // Current position in undo history
+
+    // Message editor state
+    msg_editor_mode: bool,
+    msg_editor_vim_mode: VimMode,
+    msg_editor_cursor_pos: (usize, usize), // (line, col)
+    msg_editor_content: Vec<String>,
+    msg_editor_vim_command: String,
+    msg_editor_scroll_offset: usize,
+    msg_editor_visual_start: Option<(usize, usize)>,
+    msg_editor_pending_g: bool,
+    msg_editor_number_prefix: Option<String>, // For number prefixes like 12j
+    msg_editor_search_query: String, // For /{filter} searches
+    msg_editor_search_mode: bool, // Whether we're in search mode
+    msg_editor_search_matches: Vec<(usize, usize)>, // All search match positions (line, col)
+    msg_editor_current_match_index: Option<usize>, // Current match index
+    msg_editor_pending_d: bool, // For dd line deletion (waiting for second d)
+    msg_editor_undo_history: Vec<Vec<String>>, // History of content states for undo
+    msg_editor_undo_cursor_history: Vec<(usize, usize)>, // History of cursor positions
+    msg_editor_undo_index: usize, // Current position in undo history
 }
-
-
-        // Formatting state for current identity
-        bold: bool,
-        italic: bool,
 impl Default for App {
     fn default() -> App {
         // Read commands from the file and set them as default values
@@ -7096,8 +8716,6 @@ impl Default for App {
             long_message: None,
             long_message_scroll_offset: 0,
             commands,
-            alt_account: None,
-            master_account: None,
             display_pm_only: false,
             display_staff_view: false,
             display_master_pm_view: false,
@@ -7105,6 +8723,46 @@ impl Default for App {
             inbox_mode: false,
             multiline_scroll_offset: 0,
             external_editor_active: false,
+            bold: false,
+            italic: false,
+            notes_mode: false,
+            notes_vim_mode: VimMode::Normal,
+            notes_cursor_pos: (0, 0),
+            notes_content: vec!["".to_string()],
+            notes_type_index: 0,
+            notes_available_types: vec!["Personal", "Public", "Staff", "Admin"],
+            notes_vim_command: String::new(),
+            notes_modified: false,
+            notes_scroll_offset: 0,
+            notes_visual_start: None,
+            notes_last_edited: None,
+            notes_pending_g: false,
+            notes_number_prefix: None,
+            notes_search_query: String::new(),
+            notes_search_mode: false,
+            notes_search_matches: Vec::new(),
+            notes_current_match_index: None,
+            notes_pending_d: false,
+            notes_undo_history: vec![vec!["".to_string()]], // Start with initial state
+            notes_undo_cursor_history: vec![(0, 0)],
+            notes_undo_index: 0,
+            msg_editor_mode: false,
+            msg_editor_vim_mode: VimMode::Normal,
+            msg_editor_cursor_pos: (0, 0),
+            msg_editor_content: vec!["".to_string()],
+            msg_editor_vim_command: String::new(),
+            msg_editor_scroll_offset: 0,
+            msg_editor_visual_start: None,
+            msg_editor_pending_g: false,
+            msg_editor_number_prefix: None,
+            msg_editor_search_query: String::new(),
+            msg_editor_search_mode: false,
+            msg_editor_search_matches: Vec::new(),
+            msg_editor_current_match_index: None,
+            msg_editor_pending_d: false,
+            msg_editor_undo_history: vec![vec!["".to_string()]], // Start with initial state
+            msg_editor_undo_cursor_history: vec![(0, 0)],
+            msg_editor_undo_index: 0,
         }
     }
 }
@@ -7149,13 +8807,14 @@ impl App {
         }
 
         let current_input = self.input.clone();
-        
+
         match self.command_history_index {
             None => {
                 // First time navigating history, save current input
                 self.temp_input = current_input.clone();
                 // Find the most recent command that starts with current input
-                let matching_commands: Vec<(usize, &String)> = self.command_history
+                let matching_commands: Vec<(usize, &String)> = self
+                    .command_history
                     .iter()
                     .enumerate()
                     .rev()
@@ -7167,7 +8826,7 @@ impl App {
                         }
                     })
                     .collect();
-                
+
                 if let Some((idx, cmd)) = matching_commands.first() {
                     self.command_history_index = Some(*idx);
                     self.input = cmd.to_string();
@@ -7176,15 +8835,17 @@ impl App {
             }
             Some(current_idx) => {
                 // Find next older matching command
-                let matching_commands: Vec<(usize, &String)> = self.command_history
+                let matching_commands: Vec<(usize, &String)> = self
+                    .command_history
                     .iter()
                     .enumerate()
                     .rev()
                     .filter(|(idx, cmd)| {
-                        *idx < current_idx && (self.temp_input.is_empty() || cmd.starts_with(&self.temp_input))
+                        *idx < current_idx
+                            && (self.temp_input.is_empty() || cmd.starts_with(&self.temp_input))
                     })
                     .collect();
-                
+
                 if let Some((idx, cmd)) = matching_commands.first() {
                     self.command_history_index = Some(*idx);
                     self.input = cmd.to_string();
@@ -7205,14 +8866,16 @@ impl App {
             }
             Some(current_idx) => {
                 // Find next newer matching command
-                let matching_commands: Vec<(usize, &String)> = self.command_history
+                let matching_commands: Vec<(usize, &String)> = self
+                    .command_history
                     .iter()
                     .enumerate()
                     .filter(|(idx, cmd)| {
-                        *idx > current_idx && (self.temp_input.is_empty() || cmd.starts_with(&self.temp_input))
+                        *idx > current_idx
+                            && (self.temp_input.is_empty() || cmd.starts_with(&self.temp_input))
                     })
                     .collect();
-                
+
                 if let Some((idx, cmd)) = matching_commands.first() {
                     self.command_history_index = Some(*idx);
                     self.input = cmd.to_string();
@@ -7230,6 +8893,1589 @@ impl App {
     fn reset_history_navigation(&mut self) {
         self.command_history_index = None;
         self.temp_input.clear();
+    }
+
+    // Notes functionality
+    fn enter_notes_mode(&mut self, client: &LeChatPHPClient) {
+        self.notes_mode = true;
+        self.input_mode = InputMode::Notes;
+        self.notes_vim_mode = VimMode::Normal;
+        self.notes_cursor_pos = (0, 0);
+        self.notes_modified = false;
+        self.notes_vim_command.clear();
+        self.notes_scroll_offset = 0;
+        self.notes_visual_start = None;
+        self.notes_pending_g = false;
+        self.notes_type_index = 0;
+        
+        // Set up available types based on user permissions
+        self.update_available_notes_types(client);
+        
+        // Only load content if we have available types
+        if !self.notes_available_types.is_empty() {
+            self.load_notes_content(client);
+        } else {
+            // No permission to view any notes
+            self.notes_content = vec!["You don't have permission to view any notes.".to_string()];
+        }
+    }
+
+    fn exit_notes_mode(&mut self) {
+        self.notes_mode = false;
+        self.input_mode = InputMode::Normal;
+    }
+
+    fn cycle_notes_type(&mut self, client: &LeChatPHPClient) {
+        // Update available types based on current permissions
+        self.update_available_notes_types(client);
+        
+        if !self.notes_available_types.is_empty() {
+            self.notes_type_index = (self.notes_type_index + 1) % self.notes_available_types.len();
+            self.load_notes_content(client);
+        } else {
+            // No types available - do nothing to prevent crash
+            return;
+        }
+    }
+
+    fn update_available_notes_types(&mut self, client: &LeChatPHPClient) {
+        let user_role = client.determine_user_role();
+        let mut available_types = vec![];
+        
+        match user_role {
+            UserRole::Guest => {
+                // Guests can only view public notes (if any)
+                available_types.push("Public");
+            }
+            UserRole::Member => {
+                // Members can view personal and public notes
+                available_types.push("Personal");
+                available_types.push("Public");
+            }
+            UserRole::Staff => {
+                // Staff can view personal, public, and staff notes
+                available_types.push("Personal");
+                available_types.push("Public");
+                available_types.push("Staff");
+            }
+            UserRole::Admin => {
+                // Admins can view all types
+                available_types.push("Personal");
+                available_types.push("Public");
+                available_types.push("Staff");
+                available_types.push("Admin");
+            }
+        }
+        
+        self.notes_available_types = available_types;
+        
+        // Ensure current index is valid
+        if self.notes_type_index >= self.notes_available_types.len() && !self.notes_available_types.is_empty() {
+            self.notes_type_index = 0;
+        }
+    }
+
+    fn load_notes_content(&mut self, client: &LeChatPHPClient) {
+        let note_type = match self.get_current_notes_type() {
+            "Personal" => "",
+            "Public" => "public",
+            "Staff" => "staff", 
+            "Admin" => "admin",
+            _ => "",
+        };
+        
+        match client.fetch_notes(note_type) {
+            Ok((content, last_edited)) => {
+                self.notes_content = content;
+                // Ensure cursor position is within bounds after loading new content
+                self.ensure_notes_cursor_bounds();
+                self.notes_modified = false;
+                self.notes_last_edited = last_edited;
+            }
+            Err(_) => {
+                self.notes_content = vec!["Failed to load notes".to_string()];
+                self.notes_cursor_pos = (0, 0);
+                self.notes_modified = false;
+                self.notes_last_edited = None;
+            }
+        }
+    }
+
+    fn ensure_notes_cursor_bounds(&mut self) {
+        if self.notes_content.is_empty() {
+            self.notes_content = vec!["".to_string()];
+            self.notes_cursor_pos = (0, 0);
+            return;
+        }
+        
+        // Ensure row is within bounds
+        if self.notes_cursor_pos.0 >= self.notes_content.len() {
+            self.notes_cursor_pos.0 = self.notes_content.len() - 1;
+        }
+        
+        // Ensure column is within bounds
+        let line_len = self.notes_content[self.notes_cursor_pos.0].len();
+        if self.notes_cursor_pos.1 > line_len {
+            self.notes_cursor_pos.1 = line_len;
+        }
+        
+        // Update scroll to make cursor visible
+        self.ensure_cursor_visible();
+    }
+
+    fn get_current_notes_type(&self) -> &str {
+        if self.notes_available_types.is_empty() {
+            "None"
+        } else {
+            self.notes_available_types[self.notes_type_index]
+        }
+    }
+
+    // Helper function to find next word boundary
+    fn find_next_word_boundary(line: &str, start_pos: usize) -> usize {
+        let chars: Vec<char> = line.chars().collect();
+        let mut pos = start_pos;
+        
+        if pos >= chars.len() {
+            return chars.len();
+        }
+        
+        // Skip current word if we're in the middle of it
+        if chars[pos].is_alphanumeric() || chars[pos] == '_' {
+            while pos < chars.len() && (chars[pos].is_alphanumeric() || chars[pos] == '_') {
+                pos += 1;
+            }
+        } else if !chars[pos].is_whitespace() {
+            // Skip punctuation
+            while pos < chars.len() && !chars[pos].is_whitespace() && !chars[pos].is_alphanumeric() && chars[pos] != '_' {
+                pos += 1;
+            }
+        }
+        
+        // Skip whitespace
+        while pos < chars.len() && chars[pos].is_whitespace() {
+            pos += 1;
+        }
+        
+        pos
+    }
+    
+    // Helper function to find previous word boundary
+    fn find_prev_word_boundary(line: &str, start_pos: usize) -> usize {
+        let chars: Vec<char> = line.chars().collect();
+        if start_pos == 0 || chars.is_empty() {
+            return 0;
+        }
+        
+        let mut pos = start_pos.saturating_sub(1);
+        
+        // Skip whitespace
+        while pos > 0 && chars[pos].is_whitespace() {
+            pos -= 1;
+        }
+        
+        if pos == 0 {
+            return 0;
+        }
+        
+        // Move to beginning of current word
+        if chars[pos].is_alphanumeric() || chars[pos] == '_' {
+            while pos > 0 && (chars[pos - 1].is_alphanumeric() || chars[pos - 1] == '_') {
+                pos -= 1;
+            }
+        } else {
+            while pos > 0 && !chars[pos - 1].is_whitespace() && !chars[pos - 1].is_alphanumeric() && chars[pos - 1] != '_' {
+                pos -= 1;
+            }
+        }
+        
+        pos
+    }
+    
+    // Helper function to search for text in content
+    fn search_in_content(content: &[String], query: &str, start_line: usize, start_col: usize) -> Option<(usize, usize)> {
+        if query.is_empty() {
+            return None;
+        }
+        
+        // Search from current position forward
+        for (line_idx, line) in content.iter().enumerate().skip(start_line) {
+            let search_start = if line_idx == start_line { start_col } else { 0 };
+            
+            if let Some(col_idx) = line[search_start..].find(query) {
+                return Some((line_idx, search_start + col_idx));
+            }
+        }
+        
+        // Wrap around to beginning if not found
+        for (line_idx, line) in content.iter().enumerate().take(start_line + 1) {
+            let search_end = if line_idx == start_line { start_col } else { line.len() };
+            
+            if let Some(col_idx) = line[..search_end].find(query) {
+                return Some((line_idx, col_idx));
+            }
+        }
+        
+        None
+    }
+
+    // Helper function to find all matches in content
+    fn find_all_matches(content: &[String], query: &str) -> Vec<(usize, usize)> {
+        let mut matches = Vec::new();
+        if query.is_empty() {
+            return matches;
+        }
+        
+        for (line_idx, line) in content.iter().enumerate() {
+            let mut start = 0;
+            while let Some(col_idx) = line[start..].find(query) {
+                matches.push((line_idx, start + col_idx));
+                start = start + col_idx + 1; // Move past this match to find next
+            }
+        }
+        
+        matches
+    }
+
+    // Navigate to next search match
+    fn notes_next_match(&mut self) {
+        if let Some(current_index) = self.notes_current_match_index {
+            if !self.notes_search_matches.is_empty() {
+                let new_index = (current_index + 1) % self.notes_search_matches.len();
+                self.notes_current_match_index = Some(new_index);
+                let (line, col) = self.notes_search_matches[new_index];
+                self.notes_cursor_pos = (line, col);
+                self.ensure_cursor_visible();
+            }
+        }
+    }
+
+    // Navigate to previous search match
+    fn notes_prev_match(&mut self) {
+        if let Some(current_index) = self.notes_current_match_index {
+            if !self.notes_search_matches.is_empty() {
+                let new_index = if current_index == 0 {
+                    self.notes_search_matches.len() - 1
+                } else {
+                    current_index - 1
+                };
+                self.notes_current_match_index = Some(new_index);
+                let (line, col) = self.notes_search_matches[new_index];
+                self.notes_cursor_pos = (line, col);
+                self.ensure_cursor_visible();
+            }
+        }
+    }
+
+    // Clear search results when changing modes
+    fn clear_notes_search_results(&mut self) {
+        self.notes_search_matches.clear();
+        self.notes_current_match_index = None;
+    }
+
+    // Navigate to next search match - message editor
+    fn msg_editor_next_match(&mut self) {
+        if let Some(current_index) = self.msg_editor_current_match_index {
+            if !self.msg_editor_search_matches.is_empty() {
+                let new_index = (current_index + 1) % self.msg_editor_search_matches.len();
+                self.msg_editor_current_match_index = Some(new_index);
+                let (line, col) = self.msg_editor_search_matches[new_index];
+                self.msg_editor_cursor_pos = (line, col);
+                self.ensure_msg_editor_cursor_visible();
+            }
+        }
+    }
+
+    // Navigate to previous search match - message editor
+    fn msg_editor_prev_match(&mut self) {
+        if let Some(current_index) = self.msg_editor_current_match_index {
+            if !self.msg_editor_search_matches.is_empty() {
+                let new_index = if current_index == 0 {
+                    self.msg_editor_search_matches.len() - 1
+                } else {
+                    current_index - 1
+                };
+                self.msg_editor_current_match_index = Some(new_index);
+                let (line, col) = self.msg_editor_search_matches[new_index];
+                self.msg_editor_cursor_pos = (line, col);
+                self.ensure_msg_editor_cursor_visible();
+            }
+        }
+    }
+
+    // Clear search results when changing modes - message editor
+    fn clear_msg_editor_search_results(&mut self) {
+        self.msg_editor_search_matches.clear();
+        self.msg_editor_current_match_index = None;
+    }
+
+    fn handle_notes_vim_key(&mut self, key: char, client: &LeChatPHPClient) -> bool {
+        match self.notes_vim_mode {
+            VimMode::Normal => self.handle_notes_normal_mode(key),
+            VimMode::Insert => self.handle_notes_insert_mode(key),
+            VimMode::Command => self.handle_notes_command_mode(key, client),
+            VimMode::Visual => self.handle_notes_visual_mode(key),
+        }
+    }
+
+    fn handle_notes_normal_mode(&mut self, key: char) -> bool {
+        // Handle search mode
+        if self.notes_search_mode {
+            match key {
+                '\r' => {
+                    // Execute search
+                    self.notes_search_mode = false;
+                    
+                    // Find all matches
+                    self.notes_search_matches = Self::find_all_matches(&self.notes_content, &self.notes_search_query);
+                    
+                    if !self.notes_search_matches.is_empty() {
+                        // Find the first match after current cursor position
+                        let current_pos = (self.notes_cursor_pos.0, self.notes_cursor_pos.1);
+                        let mut match_index = 0;
+                        
+                        for (i, &match_pos) in self.notes_search_matches.iter().enumerate() {
+                            if match_pos > current_pos {
+                                match_index = i;
+                                break;
+                            }
+                            // If no match after cursor, wrap to first match
+                            match_index = i;
+                        }
+                        
+                        self.notes_current_match_index = Some(match_index);
+                        let (line, col) = self.notes_search_matches[match_index];
+                        self.notes_cursor_pos = (line, col);
+                        self.ensure_cursor_visible();
+                    } else {
+                        self.notes_current_match_index = None;
+                    }
+                    
+                    self.notes_search_query.clear();
+                    return true;
+                }
+                '\x1b' => {
+                    // Escape - cancel search
+                    self.notes_search_mode = false;
+                    self.notes_search_query.clear();
+                    return true;
+                }
+                '\x08' => {
+                    // Backspace
+                    self.notes_search_query.pop();
+                    return true;
+                }
+                c if c.is_ascii() && !c.is_control() => {
+                    self.notes_search_query.push(c);
+                    return true;
+                }
+                _ => return true,
+            }
+        }
+
+        // Handle pending 'g' commands
+        if self.notes_pending_g {
+            self.notes_pending_g = false;
+            match key {
+                'g' => {
+                    // gg - go to top
+                    self.notes_cursor_pos = (0, 0);
+                    self.notes_scroll_offset = 0;
+                    return true;
+                }
+                _ => {
+                    // Invalid g command, fall through
+                }
+            }
+        }
+
+        // Handle pending 'd' commands (dd for line deletion)
+        if self.notes_pending_d {
+            self.notes_pending_d = false;
+            match key {
+                'd' => {
+                    // dd - delete line
+                    self.handle_notes_dd();
+                    return true;
+                }
+                '\x1b' => {
+                    // Escape - cancel dd
+                    return true;
+                }
+                _ => {
+                    // Invalid d command, fall through to normal processing
+                }
+            }
+        }
+
+        // Handle number prefixes - special handling for '0'
+        if key.is_ascii_digit() {
+            if self.notes_number_prefix.is_none() {
+                // First digit
+                if key == '0' {
+                    // '0' as first digit should be treated as motion (start of line), not number prefix
+                    // Fall through to normal key handling
+                } else {
+                    // '1'-'9' as first digit starts number prefix
+                    self.notes_number_prefix = Some(String::new());
+                    self.notes_number_prefix.as_mut().unwrap().push(key);
+                    return true;
+                }
+            } else {
+                // Subsequent digit (including '0') can be added to existing prefix
+                self.notes_number_prefix.as_mut().unwrap().push(key);
+                return true;
+            }
+        }
+
+        // Get repetition count
+        let count = if let Some(ref prefix) = self.notes_number_prefix {
+            prefix.parse::<usize>().unwrap_or(1)
+        } else {
+            1
+        };
+        
+        // Clear number prefix after using it
+        self.notes_number_prefix = None;
+
+        // Clear pending states if any other key is pressed (except the expected ones)
+        let should_clear_pending_states = match key {
+            'd' if !self.notes_pending_d => false, // Allow first 'd'
+            'd' | '\x1b' => false, // Allow second 'd' or escape when pending
+            _ if self.notes_pending_d => true, // Clear pending 'd' for any other key
+            _ => false,
+        };
+        
+        if should_clear_pending_states {
+            self.notes_pending_d = false;
+        }
+
+        match key {
+            'h' => {
+                for _ in 0..count {
+                    if self.notes_cursor_pos.1 > 0 {
+                        self.notes_cursor_pos.1 -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                self.ensure_cursor_visible();
+                true
+            }
+            'j' => {
+                for _ in 0..count {
+                    if self.notes_cursor_pos.0 < self.notes_content.len() - 1 {
+                        self.notes_cursor_pos.0 += 1;
+                        let line_len = self.notes_content[self.notes_cursor_pos.0].len();
+                        if self.notes_cursor_pos.1 > line_len {
+                            self.notes_cursor_pos.1 = line_len;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                self.ensure_cursor_visible();
+                true
+            }
+            'k' => {
+                for _ in 0..count {
+                    if self.notes_cursor_pos.0 > 0 {
+                        self.notes_cursor_pos.0 -= 1;
+                        let line_len = self.notes_content[self.notes_cursor_pos.0].len();
+                        if self.notes_cursor_pos.1 > line_len {
+                            self.notes_cursor_pos.1 = line_len;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                self.ensure_cursor_visible();
+                true
+            }
+            'l' => {
+                for _ in 0..count {
+                    let line_len = self.notes_content[self.notes_cursor_pos.0].len();
+                    if self.notes_cursor_pos.1 < line_len {
+                        self.notes_cursor_pos.1 += 1;
+                    } else {
+                        break;
+                    }
+                }
+                self.ensure_cursor_visible();
+                true
+            }
+            'w' => {
+                // Word forward
+                for _ in 0..count {
+                    let current_line = &self.notes_content[self.notes_cursor_pos.0];
+                    let new_col = Self::find_next_word_boundary(current_line, self.notes_cursor_pos.1);
+                    
+                    if new_col < current_line.len() {
+                        self.notes_cursor_pos.1 = new_col;
+                    } else if self.notes_cursor_pos.0 < self.notes_content.len() - 1 {
+                        // Move to beginning of next line
+                        self.notes_cursor_pos.0 += 1;
+                        self.notes_cursor_pos.1 = 0;
+                        // Skip to first non-whitespace character
+                        let next_line = &self.notes_content[self.notes_cursor_pos.0];
+                        for (i, ch) in next_line.chars().enumerate() {
+                            if !ch.is_whitespace() {
+                                self.notes_cursor_pos.1 = i;
+                                break;
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                self.ensure_cursor_visible();
+                true
+            }
+            'b' => {
+                // Word backward
+                for _ in 0..count {
+                    let current_line = &self.notes_content[self.notes_cursor_pos.0];
+                    let new_col = Self::find_prev_word_boundary(current_line, self.notes_cursor_pos.1);
+                    
+                    if new_col < self.notes_cursor_pos.1 {
+                        self.notes_cursor_pos.1 = new_col;
+                    } else if self.notes_cursor_pos.0 > 0 {
+                        // Move to end of previous line
+                        self.notes_cursor_pos.0 -= 1;
+                        self.notes_cursor_pos.1 = self.notes_content[self.notes_cursor_pos.0].len();
+                    } else {
+                        break;
+                    }
+                }
+                self.ensure_cursor_visible();
+                true
+            }
+            '$' => {
+                // End of line
+                self.notes_cursor_pos.1 = self.notes_content[self.notes_cursor_pos.0].len();
+                self.ensure_cursor_visible();
+                true
+            }
+            '0' => {
+                // Beginning of line
+                self.notes_cursor_pos.1 = 0;
+                self.ensure_cursor_visible();
+                true
+            }
+            '/' => {
+                // Start search
+                self.notes_search_mode = true;
+                self.notes_search_query.clear();
+                true
+            }
+            'G' => {
+                // Go to end of file
+                self.notes_cursor_pos.0 = self.notes_content.len() - 1;
+                self.notes_cursor_pos.1 = self.notes_content[self.notes_cursor_pos.0].len();
+                self.ensure_cursor_visible();
+                true
+            }
+            'g' => {
+                // Start of gg command
+                self.notes_pending_g = true;
+                true
+            }
+            'i' => {
+                // Save state before entering insert mode
+                self.save_notes_state();
+                self.clear_notes_search_results(); // Clear search on mode change
+                self.notes_vim_mode = VimMode::Insert;
+                true
+            }
+            'a' => {
+                // Save state before entering insert mode
+                self.save_notes_state();
+                self.clear_notes_search_results(); // Clear search on mode change
+                self.notes_vim_mode = VimMode::Insert;
+                let line_len = self.notes_content[self.notes_cursor_pos.0].len();
+                if self.notes_cursor_pos.1 < line_len {
+                    self.notes_cursor_pos.1 += 1;
+                }
+                true
+            }
+            'A' => {
+                // Append at end of line
+                // Save state before entering insert mode
+                self.save_notes_state();
+                self.clear_notes_search_results(); // Clear search on mode change
+                self.notes_vim_mode = VimMode::Insert;
+                self.notes_cursor_pos.1 = self.notes_content[self.notes_cursor_pos.0].len();
+                true
+            }
+            'x' => {
+                // Delete character under cursor
+                // Save state before making changes
+                self.save_notes_state();
+                let (line, col) = self.notes_cursor_pos;
+                if col < self.notes_content[line].len() {
+                    self.notes_content[line].remove(col);
+                    self.notes_modified = true;
+                    self.update_last_edited();
+                }
+                true
+            }
+            'v' => {
+                // Enter visual mode
+                self.notes_vim_mode = VimMode::Visual;
+                self.notes_visual_start = Some(self.notes_cursor_pos);
+                true
+            }
+            'u' => {
+                // Undo
+                self.notes_undo();
+                true
+            }
+            'd' => {
+                // First 'd' - wait for second one
+                self.notes_pending_d = true;
+                true
+            }
+            ':' => {
+                self.notes_vim_mode = VimMode::Command;
+                self.notes_vim_command.clear();
+                true
+            }
+            'n' => {
+                // Next search match
+                self.notes_next_match();
+                true
+            }
+            'N' => {
+                // Previous search match
+                self.notes_prev_match();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_notes_insert_mode(&mut self, key: char) -> bool {
+        if key == '\x1b' {
+            // Escape key
+            self.notes_vim_mode = VimMode::Normal;
+            if self.notes_cursor_pos.1 > 0 {
+                self.notes_cursor_pos.1 -= 1;
+            }
+            self.update_last_edited();
+            return true;
+        }
+
+        // Clear search results when in insert mode (mode switch)
+        if !self.notes_search_matches.is_empty() {
+            self.clear_notes_search_results();
+        }
+
+        match key {
+            '\n' | '\r' => {
+                let (line, col) = self.notes_cursor_pos;
+                let current_line = self.notes_content[line].clone();
+                let (left, right) = current_line.split_at(col);
+                self.notes_content[line] = left.to_string();
+                self.notes_content.insert(line + 1, right.to_string());
+                self.notes_cursor_pos = (line + 1, 0);
+                self.notes_modified = true;
+                self.ensure_cursor_visible();
+                true
+            }
+            '\x08' | '\x7f' => {
+                // Backspace
+                if self.notes_cursor_pos.1 > 0 {
+                    let (line, col) = self.notes_cursor_pos;
+                    self.notes_content[line].remove(col - 1);
+                    self.notes_cursor_pos.1 -= 1;
+                    self.notes_modified = true;
+                } else if self.notes_cursor_pos.0 > 0 {
+                    // Join with previous line
+                    let current_line = self.notes_content.remove(self.notes_cursor_pos.0);
+                    self.notes_cursor_pos.0 -= 1;
+                    self.notes_cursor_pos.1 = self.notes_content[self.notes_cursor_pos.0].len();
+                    self.notes_content[self.notes_cursor_pos.0].push_str(&current_line);
+                    self.notes_modified = true;
+                    self.ensure_cursor_visible();
+                }
+                true
+            }
+            c if c.is_ascii() && !c.is_control() => {
+                let (line, col) = self.notes_cursor_pos;
+                self.notes_content[line].insert(col, c);
+                self.notes_cursor_pos.1 += 1;
+                self.notes_modified = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_notes_visual_mode(&mut self, key: char) -> bool {
+        match key {
+            'h' => {
+                if self.notes_cursor_pos.1 > 0 {
+                    self.notes_cursor_pos.1 -= 1;
+                }
+                self.ensure_cursor_visible();
+                true
+            }
+            'j' => {
+                if self.notes_cursor_pos.0 < self.notes_content.len() - 1 {
+                    self.notes_cursor_pos.0 += 1;
+                    let line_len = self.notes_content[self.notes_cursor_pos.0].len();
+                    if self.notes_cursor_pos.1 > line_len {
+                        self.notes_cursor_pos.1 = line_len;
+                    }
+                }
+                self.ensure_cursor_visible();
+                true
+            }
+            'k' => {
+                if self.notes_cursor_pos.0 > 0 {
+                    self.notes_cursor_pos.0 -= 1;
+                    let line_len = self.notes_content[self.notes_cursor_pos.0].len();
+                    if self.notes_cursor_pos.1 > line_len {
+                        self.notes_cursor_pos.1 = line_len;
+                    }
+                }
+                self.ensure_cursor_visible();
+                true
+            }
+            'l' => {
+                let line_len = self.notes_content[self.notes_cursor_pos.0].len();
+                if self.notes_cursor_pos.1 < line_len {
+                    self.notes_cursor_pos.1 += 1;
+                }
+                self.ensure_cursor_visible();
+                true
+            }
+            'x' => {
+                // Delete selected text
+                self.delete_visual_selection();
+                self.notes_vim_mode = VimMode::Normal;
+                self.notes_visual_start = None;
+                true
+            }
+            '\x1b' => {
+                // Escape - exit visual mode
+                self.notes_vim_mode = VimMode::Normal;
+                self.notes_visual_start = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_notes_command_mode(&mut self, key: char, client: &LeChatPHPClient) -> bool {
+        match key {
+            '\n' | '\r' => {
+                self.execute_notes_vim_command(client);
+                self.notes_vim_mode = VimMode::Normal;
+                true
+            }
+            '\x1b' => {
+                // Escape
+                self.notes_vim_mode = VimMode::Normal;
+                self.notes_vim_command.clear();
+                true
+            }
+            '\x08' | '\x7f' => {
+                // Backspace
+                self.notes_vim_command.pop();
+                true
+            }
+            c if c.is_ascii() => {
+                self.notes_vim_command.push(c);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn execute_notes_vim_command(&mut self, client: &LeChatPHPClient) {
+        match self.notes_vim_command.as_str() {
+            "w" => {
+                // Save notes
+                if let Err(_) = self.save_notes_to_server(client) {
+                    // TODO: Show error message
+                } else {
+                    self.notes_modified = false;
+                    self.update_last_edited();
+                }
+            }
+            "q" => {
+                if !self.notes_modified {
+                    self.exit_notes_mode();
+                }
+                // TODO: Show warning if modified
+            }
+            "wq" => {
+                // Save and quit
+                if let Err(_) = self.save_notes_to_server(client) {
+                    // TODO: Show error message, don't quit
+                } else {
+                    self.notes_modified = false;
+                    self.update_last_edited();
+                    self.exit_notes_mode();
+                }
+            }
+            _ => {}
+        }
+        self.notes_vim_command.clear();
+    }
+
+    fn save_notes_to_server(&self, client: &LeChatPHPClient) -> Result<(), Box<dyn std::error::Error>> {
+        let note_type = match self.get_current_notes_type() {
+            "Personal" => "",
+            "Public" => "public",
+            "Staff" => "staff",
+            "Admin" => "admin",
+            _ => "",
+        };
+        
+        client.save_notes(note_type, &self.notes_content)
+    }
+
+    fn handle_notes_dd(&mut self) {
+        // Save state before making changes
+        self.save_notes_state();
+        
+        let (line, _) = self.notes_cursor_pos;
+        if self.notes_content.len() > 1 {
+            self.notes_content.remove(line);
+            if line >= self.notes_content.len() {
+                self.notes_cursor_pos.0 = self.notes_content.len() - 1;
+            }
+            self.notes_cursor_pos.1 = 0;
+            self.notes_modified = true;
+        } else {
+            // Clear the only line
+            self.notes_content[0].clear();
+            self.notes_cursor_pos = (0, 0);
+            self.notes_modified = true;
+        }
+    }
+
+    fn ensure_cursor_visible(&mut self) {
+        let visible_lines = 50; // Conservative estimate - UI will handle actual height
+        let (line, _) = self.notes_cursor_pos;
+        
+        if line < self.notes_scroll_offset {
+            self.notes_scroll_offset = line;
+        } else if line >= self.notes_scroll_offset + visible_lines {
+            self.notes_scroll_offset = line - visible_lines + 1;
+        }
+    }
+
+    fn update_last_edited(&mut self) {
+        use chrono::Local;
+        let now = Local::now();
+        let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
+        self.notes_last_edited = Some(format!("Modified locally at {}", timestamp));
+    }
+
+    fn delete_visual_selection(&mut self) {
+        if let Some(start) = self.notes_visual_start {
+            let end = self.notes_cursor_pos;
+            let (start_pos, end_pos) = if start <= end {
+                (start, end)
+            } else {
+                (end, start)
+            };
+
+            // Simple single-line selection for now
+            if start_pos.0 == end_pos.0 {
+                let line = start_pos.0;
+                let start_col = start_pos.1;
+                let end_col = end_pos.1;
+                
+                if start_col < end_col && end_col <= self.notes_content[line].len() {
+                    self.notes_content[line].drain(start_col..end_col);
+                    self.notes_cursor_pos = start_pos;
+                    self.notes_modified = true;
+                    self.update_last_edited();
+                }
+            }
+        }
+    }
+
+    // Message editor functionality
+    fn enter_message_editor_mode(&mut self) {
+        self.msg_editor_mode = true;
+        self.input_mode = InputMode::MessageEditor;
+        self.msg_editor_vim_mode = VimMode::Normal;
+        self.msg_editor_cursor_pos = (0, 0);
+        self.msg_editor_vim_command.clear();
+        self.msg_editor_scroll_offset = 0;
+        self.msg_editor_visual_start = None;
+        self.msg_editor_pending_g = false;
+
+        // Copy input content to editor, split by lines
+        if !self.input.is_empty() {
+            self.msg_editor_content = self.input.split('\n').map(|s| s.to_string()).collect();
+        } else {
+            self.msg_editor_content = vec!["".to_string()];
+        }
+        
+        // Position cursor at end
+        if !self.msg_editor_content.is_empty() {
+            let last_line = self.msg_editor_content.len() - 1;
+            let last_col = self.msg_editor_content[last_line].len();
+            self.msg_editor_cursor_pos = (last_line, last_col);
+        }
+    }
+
+    fn exit_message_editor_mode(&mut self) {
+        self.msg_editor_mode = false;
+        self.input_mode = InputMode::Editing;
+    }
+
+
+    fn handle_msg_editor_vim_key(&mut self, key: char) -> EditorCommand {
+        match self.msg_editor_vim_mode {
+            VimMode::Normal => {
+                self.handle_msg_editor_normal_mode(key);
+                EditorCommand::None
+            }
+            VimMode::Insert => {
+                self.handle_msg_editor_insert_mode(key);
+                EditorCommand::None
+            }
+            VimMode::Command => self.handle_msg_editor_command_mode(key),
+            VimMode::Visual => {
+                self.handle_msg_editor_visual_mode(key);
+                EditorCommand::None
+            }
+        }
+    }
+
+    fn handle_msg_editor_normal_mode(&mut self, key: char) -> bool {
+        // Handle search mode
+        if self.msg_editor_search_mode {
+            match key {
+                '\r' => {
+                    // Execute search
+                    self.msg_editor_search_mode = false;
+                    
+                    // Find all matches
+                    self.msg_editor_search_matches = Self::find_all_matches(&self.msg_editor_content, &self.msg_editor_search_query);
+                    
+                    if !self.msg_editor_search_matches.is_empty() {
+                        // Find the first match after current cursor position
+                        let current_pos = (self.msg_editor_cursor_pos.0, self.msg_editor_cursor_pos.1);
+                        let mut match_index = 0;
+                        
+                        for (i, &match_pos) in self.msg_editor_search_matches.iter().enumerate() {
+                            if match_pos > current_pos {
+                                match_index = i;
+                                break;
+                            }
+                            // If no match after cursor, wrap to first match
+                            match_index = i;
+                        }
+                        
+                        self.msg_editor_current_match_index = Some(match_index);
+                        let (line, col) = self.msg_editor_search_matches[match_index];
+                        self.msg_editor_cursor_pos = (line, col);
+                        self.ensure_msg_editor_cursor_visible();
+                    } else {
+                        self.msg_editor_current_match_index = None;
+                    }
+                    
+                    self.msg_editor_search_query.clear();
+                    return true;
+                }
+                '\x1b' => {
+                    // Escape - cancel search
+                    self.msg_editor_search_mode = false;
+                    self.msg_editor_search_query.clear();
+                    return true;
+                }
+                '\x08' => {
+                    // Backspace
+                    self.msg_editor_search_query.pop();
+                    return true;
+                }
+                c if c.is_ascii() && !c.is_control() => {
+                    self.msg_editor_search_query.push(c);
+                    return true;
+                }
+                _ => return true,
+            }
+        }
+
+        // Handle pending 'g' commands
+        if self.msg_editor_pending_g {
+            self.msg_editor_pending_g = false;
+            match key {
+                'g' => {
+                    // gg - go to top
+                    self.msg_editor_cursor_pos = (0, 0);
+                    self.msg_editor_scroll_offset = 0;
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
+        // Handle pending 'd' commands (dd for line deletion)
+        if self.msg_editor_pending_d {
+            self.msg_editor_pending_d = false;
+            match key {
+                'd' => {
+                    // dd - delete line
+                    self.handle_msg_editor_dd();
+                    return true;
+                }
+                '\x1b' => {
+                    // Escape - cancel dd
+                    return true;
+                }
+                _ => {
+                    // Invalid d command, fall through to normal processing
+                }
+            }
+        }
+
+        // Handle number prefixes - special handling for '0'
+        if key.is_ascii_digit() {
+            if self.msg_editor_number_prefix.is_none() {
+                // First digit
+                if key == '0' {
+                    // '0' as first digit should be treated as motion (start of line), not number prefix
+                    // Fall through to normal key handling
+                } else {
+                    // '1'-'9' as first digit starts number prefix
+                    self.msg_editor_number_prefix = Some(String::new());
+                    self.msg_editor_number_prefix.as_mut().unwrap().push(key);
+                    return true;
+                }
+            } else {
+                // Subsequent digit (including '0') can be added to existing prefix
+                self.msg_editor_number_prefix.as_mut().unwrap().push(key);
+                return true;
+            }
+        }
+
+        // Get repetition count
+        let count = if let Some(ref prefix) = self.msg_editor_number_prefix {
+            prefix.parse::<usize>().unwrap_or(1)
+        } else {
+            1
+        };
+        
+        // Clear number prefix after using it
+        self.msg_editor_number_prefix = None;
+
+        // Clear pending states if any other key is pressed (except the expected ones)
+        let should_clear_pending_states = match key {
+            'd' if !self.msg_editor_pending_d => false, // Allow first 'd'
+            'd' | '\x1b' => false, // Allow second 'd' or escape when pending
+            _ if self.msg_editor_pending_d => true, // Clear pending 'd' for any other key
+            _ => false,
+        };
+        
+        if should_clear_pending_states {
+            self.msg_editor_pending_d = false;
+        }
+
+        match key {
+            'h' => {
+                for _ in 0..count {
+                    if self.msg_editor_cursor_pos.1 > 0 {
+                        self.msg_editor_cursor_pos.1 -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                self.ensure_msg_editor_cursor_visible();
+                true
+            }
+            'j' => {
+                for _ in 0..count {
+                    if self.msg_editor_cursor_pos.0 < self.msg_editor_content.len() - 1 {
+                        self.msg_editor_cursor_pos.0 += 1;
+                        let line_len = self.msg_editor_content[self.msg_editor_cursor_pos.0].len();
+                        if self.msg_editor_cursor_pos.1 > line_len {
+                            self.msg_editor_cursor_pos.1 = line_len;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                self.ensure_msg_editor_cursor_visible();
+                true
+            }
+            'k' => {
+                for _ in 0..count {
+                    if self.msg_editor_cursor_pos.0 > 0 {
+                        self.msg_editor_cursor_pos.0 -= 1;
+                        let line_len = self.msg_editor_content[self.msg_editor_cursor_pos.0].len();
+                        if self.msg_editor_cursor_pos.1 > line_len {
+                            self.msg_editor_cursor_pos.1 = line_len;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                self.ensure_msg_editor_cursor_visible();
+                true
+            }
+            'l' => {
+                for _ in 0..count {
+                    let line_len = self.msg_editor_content[self.msg_editor_cursor_pos.0].len();
+                    if self.msg_editor_cursor_pos.1 < line_len {
+                        self.msg_editor_cursor_pos.1 += 1;
+                    } else {
+                        break;
+                    }
+                }
+                self.ensure_msg_editor_cursor_visible();
+                true
+            }
+            'w' => {
+                // Word forward
+                for _ in 0..count {
+                    let current_line = &self.msg_editor_content[self.msg_editor_cursor_pos.0];
+                    let new_col = Self::find_next_word_boundary(current_line, self.msg_editor_cursor_pos.1);
+                    
+                    if new_col < current_line.len() {
+                        self.msg_editor_cursor_pos.1 = new_col;
+                    } else if self.msg_editor_cursor_pos.0 < self.msg_editor_content.len() - 1 {
+                        // Move to beginning of next line
+                        self.msg_editor_cursor_pos.0 += 1;
+                        self.msg_editor_cursor_pos.1 = 0;
+                        // Skip to first non-whitespace character
+                        let next_line = &self.msg_editor_content[self.msg_editor_cursor_pos.0];
+                        for (i, ch) in next_line.chars().enumerate() {
+                            if !ch.is_whitespace() {
+                                self.msg_editor_cursor_pos.1 = i;
+                                break;
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                self.ensure_msg_editor_cursor_visible();
+                true
+            }
+            'b' => {
+                // Word backward
+                for _ in 0..count {
+                    let current_line = &self.msg_editor_content[self.msg_editor_cursor_pos.0];
+                    let new_col = Self::find_prev_word_boundary(current_line, self.msg_editor_cursor_pos.1);
+                    
+                    if new_col < self.msg_editor_cursor_pos.1 {
+                        self.msg_editor_cursor_pos.1 = new_col;
+                    } else if self.msg_editor_cursor_pos.0 > 0 {
+                        // Move to end of previous line
+                        self.msg_editor_cursor_pos.0 -= 1;
+                        self.msg_editor_cursor_pos.1 = self.msg_editor_content[self.msg_editor_cursor_pos.0].len();
+                    } else {
+                        break;
+                    }
+                }
+                self.ensure_msg_editor_cursor_visible();
+                true
+            }
+            '$' => {
+                // End of line
+                self.msg_editor_cursor_pos.1 = self.msg_editor_content[self.msg_editor_cursor_pos.0].len();
+                self.ensure_msg_editor_cursor_visible();
+                true
+            }
+            '0' => {
+                // Beginning of line
+                self.msg_editor_cursor_pos.1 = 0;
+                self.ensure_msg_editor_cursor_visible();
+                true
+            }
+            '/' => {
+                // Start search
+                self.msg_editor_search_mode = true;
+                self.msg_editor_search_query.clear();
+                true
+            }
+            'G' => {
+                self.msg_editor_cursor_pos.0 = self.msg_editor_content.len() - 1;
+                self.msg_editor_cursor_pos.1 = self.msg_editor_content[self.msg_editor_cursor_pos.0].len();
+                self.ensure_msg_editor_cursor_visible();
+                true
+            }
+            'g' => {
+                self.msg_editor_pending_g = true;
+                true
+            }
+            'i' => {
+                // Save state before entering insert mode
+                self.save_msg_editor_state();
+                self.clear_msg_editor_search_results(); // Clear search on mode change
+                self.msg_editor_vim_mode = VimMode::Insert;
+                true
+            }
+            'a' => {
+                // Save state before entering insert mode
+                self.save_msg_editor_state();
+                self.clear_msg_editor_search_results(); // Clear search on mode change
+                self.msg_editor_vim_mode = VimMode::Insert;
+                let line_len = self.msg_editor_content[self.msg_editor_cursor_pos.0].len();
+                if self.msg_editor_cursor_pos.1 < line_len {
+                    self.msg_editor_cursor_pos.1 += 1;
+                }
+                true
+            }
+            'A' => {
+                // Save state before entering insert mode
+                self.save_msg_editor_state();
+                self.clear_msg_editor_search_results(); // Clear search on mode change
+                self.msg_editor_vim_mode = VimMode::Insert;
+                self.msg_editor_cursor_pos.1 = self.msg_editor_content[self.msg_editor_cursor_pos.0].len();
+                true
+            }
+            'x' => {
+                // Save state before making changes
+                self.save_msg_editor_state();
+                let (line, col) = self.msg_editor_cursor_pos;
+                if col < self.msg_editor_content[line].len() {
+                    self.msg_editor_content[line].remove(col);
+                }
+                true
+            }
+            'v' => {
+                self.msg_editor_vim_mode = VimMode::Visual;
+                self.msg_editor_visual_start = Some(self.msg_editor_cursor_pos);
+                true
+            }
+            'u' => {
+                // Undo
+                self.msg_editor_undo();
+                true
+            }
+            'd' => {
+                // First 'd' - wait for second one
+                self.msg_editor_pending_d = true;
+                true
+            }
+            ':' => {
+                self.msg_editor_vim_mode = VimMode::Command;
+                self.msg_editor_vim_command.clear();
+                true
+            }
+            'n' => {
+                // Next search match
+                self.msg_editor_next_match();
+                true
+            }
+            'N' => {
+                // Previous search match
+                self.msg_editor_prev_match();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_msg_editor_insert_mode(&mut self, key: char) -> bool {
+        if key == '\x1b' {
+            self.msg_editor_vim_mode = VimMode::Normal;
+            if self.msg_editor_cursor_pos.1 > 0 {
+                self.msg_editor_cursor_pos.1 -= 1;
+            }
+            return true;
+        }
+
+        // Clear search results when in insert mode (mode switch)
+        if !self.msg_editor_search_matches.is_empty() {
+            self.clear_msg_editor_search_results();
+        }
+
+        match key {
+            '\n' | '\r' => {
+                let (line, col) = self.msg_editor_cursor_pos;
+                let current_line = self.msg_editor_content[line].clone();
+                let (left, right) = current_line.split_at(col);
+                self.msg_editor_content[line] = left.to_string();
+                self.msg_editor_content.insert(line + 1, right.to_string());
+                self.msg_editor_cursor_pos = (line + 1, 0);
+                self.ensure_msg_editor_cursor_visible();
+                true
+            }
+            '\x08' | '\x7f' => {
+                if self.msg_editor_cursor_pos.1 > 0 {
+                    let (line, col) = self.msg_editor_cursor_pos;
+                    self.msg_editor_content[line].remove(col - 1);
+                    self.msg_editor_cursor_pos.1 -= 1;
+                } else if self.msg_editor_cursor_pos.0 > 0 {
+                    let current_line = self.msg_editor_content.remove(self.msg_editor_cursor_pos.0);
+                    self.msg_editor_cursor_pos.0 -= 1;
+                    self.msg_editor_cursor_pos.1 = self.msg_editor_content[self.msg_editor_cursor_pos.0].len();
+                    self.msg_editor_content[self.msg_editor_cursor_pos.0].push_str(&current_line);
+                    self.ensure_msg_editor_cursor_visible();
+                }
+                true
+            }
+            c if c.is_ascii() && !c.is_control() => {
+                let (line, col) = self.msg_editor_cursor_pos;
+                self.msg_editor_content[line].insert(col, c);
+                self.msg_editor_cursor_pos.1 += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_msg_editor_visual_mode(&mut self, key: char) -> bool {
+        match key {
+            'h' => {
+                if self.msg_editor_cursor_pos.1 > 0 {
+                    self.msg_editor_cursor_pos.1 -= 1;
+                }
+                self.ensure_msg_editor_cursor_visible();
+                true
+            }
+            'j' => {
+                if self.msg_editor_cursor_pos.0 < self.msg_editor_content.len() - 1 {
+                    self.msg_editor_cursor_pos.0 += 1;
+                    let line_len = self.msg_editor_content[self.msg_editor_cursor_pos.0].len();
+                    if self.msg_editor_cursor_pos.1 > line_len {
+                        self.msg_editor_cursor_pos.1 = line_len;
+                    }
+                }
+                self.ensure_msg_editor_cursor_visible();
+                true
+            }
+            'k' => {
+                if self.msg_editor_cursor_pos.0 > 0 {
+                    self.msg_editor_cursor_pos.0 -= 1;
+                    let line_len = self.msg_editor_content[self.msg_editor_cursor_pos.0].len();
+                    if self.msg_editor_cursor_pos.1 > line_len {
+                        self.msg_editor_cursor_pos.1 = line_len;
+                    }
+                }
+                self.ensure_msg_editor_cursor_visible();
+                true
+            }
+            'l' => {
+                let line_len = self.msg_editor_content[self.msg_editor_cursor_pos.0].len();
+                if self.msg_editor_cursor_pos.1 < line_len {
+                    self.msg_editor_cursor_pos.1 += 1;
+                }
+                self.ensure_msg_editor_cursor_visible();
+                true
+            }
+            'x' => {
+                self.delete_msg_editor_visual_selection();
+                self.msg_editor_vim_mode = VimMode::Normal;
+                self.msg_editor_visual_start = None;
+                true
+            }
+            '\x1b' => {
+                self.msg_editor_vim_mode = VimMode::Normal;
+                self.msg_editor_visual_start = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_msg_editor_command_mode(&mut self, key: char) -> EditorCommand {
+        match key {
+            '\n' | '\r' => {
+                let command = self.execute_msg_editor_vim_command();
+                self.msg_editor_vim_mode = VimMode::Normal;
+                return command;
+            }
+            '\x1b' => {
+                self.msg_editor_vim_mode = VimMode::Normal;
+                self.msg_editor_vim_command.clear();
+                EditorCommand::None
+            }
+            '\x08' | '\x7f' => {
+                self.msg_editor_vim_command.pop();
+                EditorCommand::None
+            }
+            c if c.is_ascii() => {
+                self.msg_editor_vim_command.push(c);
+                EditorCommand::None
+            }
+            _ => EditorCommand::None,
+        }
+    }
+
+    fn execute_msg_editor_vim_command(&mut self) -> EditorCommand {
+        let command = match self.msg_editor_vim_command.as_str() {
+            "w" => {
+                // Send message and exit
+                let content = self.msg_editor_content.join("\n");
+                self.exit_message_editor_mode();
+                self.msg_editor_vim_command.clear();
+                EditorCommand::Send(content)
+            }
+            "q" => {
+                // Quit without sending
+                self.exit_message_editor_mode();
+                self.msg_editor_vim_command.clear();
+                EditorCommand::Quit
+            }
+            "wq" => {
+                // Send and quit (same as :w)
+                let content = self.msg_editor_content.join("\n");
+                self.exit_message_editor_mode();
+                self.msg_editor_vim_command.clear();
+                EditorCommand::Send(content)
+            }
+            _ => {
+                self.msg_editor_vim_command.clear();
+                EditorCommand::None
+            }
+        };
+        command
+    }
+
+    fn handle_msg_editor_dd(&mut self) {
+        // Save state before making changes
+        self.save_msg_editor_state();
+        
+        let (line, _) = self.msg_editor_cursor_pos;
+        if self.msg_editor_content.len() > 1 {
+            self.msg_editor_content.remove(line);
+            if line >= self.msg_editor_content.len() {
+                self.msg_editor_cursor_pos.0 = self.msg_editor_content.len() - 1;
+            }
+            self.msg_editor_cursor_pos.1 = 0;
+        } else {
+            self.msg_editor_content[0].clear();
+            self.msg_editor_cursor_pos = (0, 0);
+        }
+    }
+
+    fn ensure_msg_editor_cursor_visible(&mut self) {
+        let visible_lines = 50; // Conservative estimate - UI will handle actual height
+        let (line, _) = self.msg_editor_cursor_pos;
+        
+        if line < self.msg_editor_scroll_offset {
+            self.msg_editor_scroll_offset = line;
+        } else if line >= self.msg_editor_scroll_offset + visible_lines {
+            self.msg_editor_scroll_offset = line - visible_lines + 1;
+        }
+    }
+
+    fn delete_msg_editor_visual_selection(&mut self) {
+        if let Some(start) = self.msg_editor_visual_start {
+            let end = self.msg_editor_cursor_pos;
+            let (start_pos, end_pos) = if start <= end {
+                (start, end)
+            } else {
+                (end, start)
+            };
+
+            if start_pos.0 == end_pos.0 {
+                let line = start_pos.0;
+                let start_col = start_pos.1;
+                let end_col = end_pos.1;
+                
+                if start_col < end_col && end_col <= self.msg_editor_content[line].len() {
+                    self.msg_editor_content[line].drain(start_col..end_col);
+                    self.msg_editor_cursor_pos = start_pos;
+                }
+            }
+        }
+    }
+
+    // Undo/Redo functionality for notes editor
+    fn save_notes_state(&mut self) {
+        // Limit history size to prevent memory bloat
+        const MAX_HISTORY: usize = 100;
+        
+        // Truncate history if we're not at the end (when doing new action after undo)
+        if self.notes_undo_index < self.notes_undo_history.len() - 1 {
+            self.notes_undo_history.truncate(self.notes_undo_index + 1);
+            self.notes_undo_cursor_history.truncate(self.notes_undo_index + 1);
+        }
+        
+        // Add new state
+        self.notes_undo_history.push(self.notes_content.clone());
+        self.notes_undo_cursor_history.push(self.notes_cursor_pos);
+        
+        // Limit history size
+        if self.notes_undo_history.len() > MAX_HISTORY {
+            self.notes_undo_history.remove(0);
+            self.notes_undo_cursor_history.remove(0);
+        } else {
+            self.notes_undo_index += 1;
+        }
+        
+        if self.notes_undo_history.len() > MAX_HISTORY {
+            self.notes_undo_index = MAX_HISTORY - 1;
+        }
+    }
+    
+    fn notes_undo(&mut self) {
+        if self.notes_undo_index > 0 {
+            self.notes_undo_index -= 1;
+            self.notes_content = self.notes_undo_history[self.notes_undo_index].clone();
+            self.notes_cursor_pos = self.notes_undo_cursor_history[self.notes_undo_index];
+            self.notes_modified = true;
+            self.ensure_cursor_visible();
+        }
+    }
+    
+    fn notes_redo(&mut self) {
+        if self.notes_undo_index < self.notes_undo_history.len() - 1 {
+            self.notes_undo_index += 1;
+            self.notes_content = self.notes_undo_history[self.notes_undo_index].clone();
+            self.notes_cursor_pos = self.notes_undo_cursor_history[self.notes_undo_index];
+            self.notes_modified = true;
+            self.ensure_cursor_visible();
+        }
+    }
+
+    // Undo/Redo functionality for message editor
+    fn save_msg_editor_state(&mut self) {
+        // Limit history size to prevent memory bloat
+        const MAX_HISTORY: usize = 100;
+        
+        // Truncate history if we're not at the end (when doing new action after undo)
+        if self.msg_editor_undo_index < self.msg_editor_undo_history.len() - 1 {
+            self.msg_editor_undo_history.truncate(self.msg_editor_undo_index + 1);
+            self.msg_editor_undo_cursor_history.truncate(self.msg_editor_undo_index + 1);
+        }
+        
+        // Add new state
+        self.msg_editor_undo_history.push(self.msg_editor_content.clone());
+        self.msg_editor_undo_cursor_history.push(self.msg_editor_cursor_pos);
+        
+        // Limit history size
+        if self.msg_editor_undo_history.len() > MAX_HISTORY {
+            self.msg_editor_undo_history.remove(0);
+            self.msg_editor_undo_cursor_history.remove(0);
+        } else {
+            self.msg_editor_undo_index += 1;
+        }
+        
+        if self.msg_editor_undo_history.len() > MAX_HISTORY {
+            self.msg_editor_undo_index = MAX_HISTORY - 1;
+        }
+    }
+    
+    fn msg_editor_undo(&mut self) {
+        if self.msg_editor_undo_index > 0 {
+            self.msg_editor_undo_index -= 1;
+            self.msg_editor_content = self.msg_editor_undo_history[self.msg_editor_undo_index].clone();
+            self.msg_editor_cursor_pos = self.msg_editor_undo_cursor_history[self.msg_editor_undo_index];
+            self.ensure_msg_editor_cursor_visible();
+        }
+    }
+    
+    fn msg_editor_redo(&mut self) {
+        if self.msg_editor_undo_index < self.msg_editor_undo_history.len() - 1 {
+            self.msg_editor_undo_index += 1;
+            self.msg_editor_content = self.msg_editor_undo_history[self.msg_editor_undo_index].clone();
+            self.msg_editor_cursor_pos = self.msg_editor_undo_cursor_history[self.msg_editor_undo_index];
+            self.ensure_msg_editor_cursor_visible();
+        }
     }
 }
 
@@ -7407,73 +10653,119 @@ mod tests {
         assert_eq!(quick_moderation_check("I want to kill my child"), None);
         assert_eq!(quick_moderation_check("how to hurt my kid"), None);
         assert_eq!(quick_moderation_check("gonna kill a child"), None);
-        
+
         // Test that safe messages are not caught
         assert_eq!(quick_moderation_check("my kid is driving me crazy"), None);
         assert_eq!(quick_moderation_check("I love my child"), None);
         assert_eq!(quick_moderation_check("hello everyone"), None);
-        
+
         // Test existing patterns still work
-        assert_eq!(quick_moderation_check("looking for cheese pizza"), Some(true));
+        assert_eq!(
+            quick_moderation_check("looking for cheese pizza"),
+            Some(true)
+        );
         assert_eq!(quick_moderation_check("young models"), Some(true));
     }
 
     #[test]
     fn test_warning_violations() {
         // Test CP-related content
-        assert_eq!(check_warning_violations("looking for cheese pizza"), Some("inappropriate content involving minors".to_string()));
-        assert_eq!(check_warning_violations("young boy pics"), Some("inappropriate content involving minors".to_string()));
-        assert_eq!(check_warning_violations("trading CP"), Some("inappropriate content involving minors".to_string()));
-        
+        assert_eq!(
+            check_warning_violations("looking for cheese pizza"),
+            Some("inappropriate content involving minors".to_string())
+        );
+        assert_eq!(
+            check_warning_violations("young boy pics"),
+            Some("inappropriate content involving minors".to_string())
+        );
+        assert_eq!(
+            check_warning_violations("trading CP"),
+            Some("inappropriate content involving minors".to_string())
+        );
+
         // Test pornography patterns
-        assert_eq!(check_warning_violations("send nudes"), Some("inappropriate adult content".to_string()));
-        assert_eq!(check_warning_violations("porn links anyone?"), Some("inappropriate adult content".to_string()));
-        assert_eq!(check_warning_violations("check out my onlyfans"), Some("inappropriate adult content".to_string()));
-        
+        assert_eq!(
+            check_warning_violations("send nudes"),
+            Some("inappropriate adult content".to_string())
+        );
+        assert_eq!(
+            check_warning_violations("porn links anyone?"),
+            Some("inappropriate adult content".to_string())
+        );
+        assert_eq!(
+            check_warning_violations("check out my onlyfans"),
+            Some("inappropriate adult content".to_string())
+        );
+
         // Test gun/weapon purchases
-        assert_eq!(check_warning_violations("want to buy gun"), Some("attempting to buy/sell weapons".to_string()));
-        assert_eq!(check_warning_violations("selling pistol"), Some("attempting to buy/sell weapons".to_string()));
-        assert_eq!(check_warning_violations("firearm for sale"), Some("attempting to buy/sell weapons".to_string()));
-        
+        assert_eq!(
+            check_warning_violations("want to buy gun"),
+            Some("attempting to buy/sell weapons".to_string())
+        );
+        assert_eq!(
+            check_warning_violations("selling pistol"),
+            Some("attempting to buy/sell weapons".to_string())
+        );
+        assert_eq!(
+            check_warning_violations("firearm for sale"),
+            Some("attempting to buy/sell weapons".to_string())
+        );
+
         // Test account hacking
-        assert_eq!(check_warning_violations("can hack facebook account"), Some("offering/requesting account hacking services".to_string()));
-        assert_eq!(check_warning_violations("instagram hacker available"), Some("offering/requesting account hacking services".to_string()));
-        assert_eq!(check_warning_violations("password crack service"), Some("offering/requesting account hacking services".to_string()));
-        
+        assert_eq!(
+            check_warning_violations("can hack facebook account"),
+            Some("offering/requesting account hacking services".to_string())
+        );
+        assert_eq!(
+            check_warning_violations("instagram hacker available"),
+            Some("offering/requesting account hacking services".to_string())
+        );
+        assert_eq!(
+            check_warning_violations("password crack service"),
+            Some("offering/requesting account hacking services".to_string())
+        );
+
         // Test spam detection
-        assert_eq!(check_warning_violations("buy buy buy buy buy buy buy buy buy buy buy"), Some("spamming/excessive repetition".to_string()));
-        
+        assert_eq!(
+            check_warning_violations("buy buy buy buy buy buy buy buy buy buy buy"),
+            Some("spamming/excessive repetition".to_string())
+        );
+
         // Test excessive caps
-        assert_eq!(check_warning_violations("THIS IS A VERY LONG MESSAGE WITH TOO MANY CAPS"), Some("excessive use of capital letters".to_string()));
-        
+        assert_eq!(
+            check_warning_violations("THIS IS A VERY LONG MESSAGE WITH TOO MANY CAPS"),
+            Some("excessive use of capital letters".to_string())
+        );
+
         // Test normal messages (should return None)
         assert_eq!(check_warning_violations("hello everyone"), None);
         assert_eq!(check_warning_violations("how are you today?"), None);
         assert_eq!(check_warning_violations("I ordered pizza for dinner"), None);
-        assert_eq!(check_warning_violations("My gun collection is nice"), None); // Should be fine, not buying/selling
+        assert_eq!(check_warning_violations("My gun collection is nice"), None);
+        // Should be fine, not buying/selling
     }
 
     #[test]
     fn test_warning_tracking() {
-        use std::sync::{Arc, Mutex};
         use std::collections::HashMap;
-        
+        use std::sync::{Arc, Mutex};
+
         // Create a simple warning tracking HashMap like the one in LeChatPHPClient
         let mut user_warnings: HashMap<String, u32> = HashMap::new();
-        
+
         // Test warning increment
         assert_eq!(user_warnings.get("testuser"), None);
-        
+
         // Simulate warnings
         user_warnings.insert("testuser".to_string(), 1);
         assert_eq!(user_warnings.get("testuser"), Some(&1));
-        
+
         user_warnings.insert("testuser".to_string(), 2);
         assert_eq!(user_warnings.get("testuser"), Some(&2));
-        
+
         user_warnings.insert("testuser".to_string(), 3);
         assert_eq!(user_warnings.get("testuser"), Some(&3));
-        
+
         // Test clearing warnings
         user_warnings.remove("testuser");
         assert_eq!(user_warnings.get("testuser"), None);
@@ -7482,48 +10774,75 @@ mod tests {
     #[test]
     fn test_directed_message_detection() {
         // Test messages directed at other users (should not trigger AI responses)
-        
+
         // Messages starting with @username
-        assert!(is_message_directed_at_other("@alice hello there", "botname"));
-        assert!(is_message_directed_at_other("@bob how are you doing?", "botname"));
-        
+        assert!(is_message_directed_at_other(
+            "@alice hello there",
+            "botname"
+        ));
+        assert!(is_message_directed_at_other(
+            "@bob how are you doing?",
+            "botname"
+        ));
+
         // Messages ending with @username
-        assert!(is_message_directed_at_other("hello there @alice", "botname"));
-        assert!(is_message_directed_at_other("this is for you @bob", "botname"));
-        
+        assert!(is_message_directed_at_other(
+            "hello there @alice",
+            "botname"
+        ));
+        assert!(is_message_directed_at_other(
+            "this is for you @bob",
+            "botname"
+        ));
+
         // Single @username messages
         assert!(is_message_directed_at_other("@alice", "botname"));
-        
+
         // Messages directed at the bot (should return false - these should trigger responses)
         assert!(!is_message_directed_at_other("@botname hello", "botname"));
         assert!(!is_message_directed_at_other("hello @botname", "botname"));
         assert!(!is_message_directed_at_other("@botname", "botname"));
-        
+
         // Messages with @username in the middle (should return false - not directed)
-        assert!(!is_message_directed_at_other("I think @alice said something", "botname"));
-        assert!(!is_message_directed_at_other("hey everyone, @alice is awesome and cool", "botname"));
-        
+        assert!(!is_message_directed_at_other(
+            "I think @alice said something",
+            "botname"
+        ));
+        assert!(!is_message_directed_at_other(
+            "hey everyone, @alice is awesome and cool",
+            "botname"
+        ));
+
         // Messages ending with @username (should return true - directed)
-        assert!(is_message_directed_at_other("I think something about @bob", "botname"));
-        assert!(is_message_directed_at_other("this message is for @alice", "botname"));
-        
+        assert!(is_message_directed_at_other(
+            "I think something about @bob",
+            "botname"
+        ));
+        assert!(is_message_directed_at_other(
+            "this message is for @alice",
+            "botname"
+        ));
+
         // Messages without any @mentions (should return false)
         assert!(!is_message_directed_at_other("hello everyone", "botname"));
-        assert!(!is_message_directed_at_other("how is everyone doing?", "botname"));
+        assert!(!is_message_directed_at_other(
+            "how is everyone doing?",
+            "botname"
+        ));
     }
 
     // Helper function to test the directed message logic
     fn is_message_directed_at_other(msg: &str, username: &str) -> bool {
         let msg_trimmed = msg.trim();
-        
+
         // Check for @username at the start (first word)
         let first_word = msg_trimmed.split_whitespace().next().unwrap_or("");
         let starts_with_tag = first_word.starts_with('@') && first_word != format!("@{}", username);
-        
+
         // Check for @username at the end (last word)
         let last_word = msg_trimmed.split_whitespace().last().unwrap_or("");
         let ends_with_tag = last_word.starts_with('@') && last_word != format!("@{}", username);
-        
+
         starts_with_tag || ends_with_tag
     }
 
@@ -7535,14 +10854,24 @@ mod tests {
 
     impl MockOpenAIClient {
         fn new(should_moderate: bool) -> Self {
-            Self { should_moderate, should_error: false }
+            Self {
+                should_moderate,
+                should_error: false,
+            }
         }
 
         fn new_with_error() -> Self {
-            Self { should_moderate: false, should_error: true }
+            Self {
+                should_moderate: false,
+                should_error: true,
+            }
         }
 
-        async fn mock_moderation_response(&self, _message: &str, _strictness: &str) -> Option<bool> {
+        async fn mock_moderation_response(
+            &self,
+            _message: &str,
+            _strictness: &str,
+        ) -> Option<bool> {
             if self.should_error {
                 return None;
             }
@@ -7554,7 +10883,7 @@ mod tests {
     async fn test_ai_moderation_system_prompt_generation() {
         // Test that different strictness levels generate appropriate prompts
         let strictness_levels = vec!["strict", "lenient", "balanced"];
-        
+
         for strictness in strictness_levels {
             let guidance = match strictness {
                 "strict" => "Be very strict. Moderate anything that could potentially violate rules. When in doubt, moderate.",
@@ -7578,34 +10907,38 @@ mod tests {
     async fn test_ai_moderation_mock_responses() {
         // Test mock client that should moderate
         let mock_client = MockOpenAIClient::new(true);
-        let result = mock_client.mock_moderation_response("harmful message", "balanced").await;
+        let result = mock_client
+            .mock_moderation_response("harmful message", "balanced")
+            .await;
         assert_eq!(result, Some(true));
 
         // Test mock client that should allow
         let mock_client = MockOpenAIClient::new(false);
-        let result = mock_client.mock_moderation_response("safe message", "balanced").await;
+        let result = mock_client
+            .mock_moderation_response("safe message", "balanced")
+            .await;
         assert_eq!(result, Some(false));
 
         // Test mock client with error
         let mock_client = MockOpenAIClient::new_with_error();
-        let result = mock_client.mock_moderation_response("any message", "balanced").await;
+        let result = mock_client
+            .mock_moderation_response("any message", "balanced")
+            .await;
         assert_eq!(result, None);
     }
 
     #[tokio::test]
     async fn test_ai_moderation_request_structure() {
-        use async_openai::{
-            types::{
-                ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage, 
-                ChatCompletionRequestUserMessage, ChatCompletionRequestSystemMessageContent,
-                ChatCompletionRequestUserMessageContent, CreateChatCompletionRequestArgs
-            }
+        use async_openai::types::{
+            ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+            ChatCompletionRequestSystemMessageContent, ChatCompletionRequestUserMessage,
+            ChatCompletionRequestUserMessageContent, CreateChatCompletionRequestArgs,
         };
 
         // Test that we can build a proper moderation request structure
         let test_message = "test message for moderation";
         let strictness = "balanced";
-        
+
         let strictness_guidance = "Use balanced judgment. Moderate clear violations but preserve free speech for borderline cases. When in doubt about context, lean towards allowing.";
 
         let system_prompt = format!(
@@ -7653,32 +10986,30 @@ mod tests {
         let request = CreateChatCompletionRequestArgs::default()
             .model("gpt-3.5-turbo")
             .messages([
-                ChatCompletionRequestMessage::System(
-                    ChatCompletionRequestSystemMessage {
-                        content: ChatCompletionRequestSystemMessageContent::Text(system_prompt.clone()),
-                        name: None,
-                    }
-                ),
-                ChatCompletionRequestMessage::User(
-                    ChatCompletionRequestUserMessage {
-                        content: ChatCompletionRequestUserMessageContent::Text(test_message.to_string()),
-                        name: None,
-                    }
-                ),
+                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                    content: ChatCompletionRequestSystemMessageContent::Text(system_prompt.clone()),
+                    name: None,
+                }),
+                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Text(
+                        test_message.to_string(),
+                    ),
+                    name: None,
+                }),
             ])
             .max_tokens(10u16)
             .build();
 
         // Verify request builds successfully
         assert!(request.is_ok());
-        
+
         // Verify system prompt contains key enforcement rules
         assert!(system_prompt.contains("STRICT ENFORCEMENT"));
         assert!(system_prompt.contains("No violence against children"));
         assert!(system_prompt.contains("should I kill my kid"));
         assert!(system_prompt.contains("MODERATE"));
         assert!(system_prompt.contains("ALLOW"));
-        
+
         // Verify the request uses the correct model and token limit
         let req = request.unwrap();
         assert_eq!(req.model, "gpt-3.5-turbo");
@@ -7693,7 +11024,7 @@ mod tests {
             "Anyone got cheese pizza links?",
             "Looking for young models",
             "I want to fuck a small kid",
-            "I really wanna fuck a small kid", 
+            "I really wanna fuck a small kid",
             "should I kill my kid",
             "I want to hurt my child",
             "how to harm children",
@@ -7716,7 +11047,12 @@ mod tests {
             // Some should be caught by quick moderation, others need AI
             let quick_result = quick_moderation_check(example);
             if quick_result.is_some() {
-                assert_eq!(quick_result, Some(true), "Quick moderation should catch: {}", example);
+                assert_eq!(
+                    quick_result,
+                    Some(true),
+                    "Quick moderation should catch: {}",
+                    example
+                );
             }
             // If not caught by quick moderation, it would go to AI
         }
@@ -7725,21 +11061,26 @@ mod tests {
         for example in &should_allow_examples {
             let quick_result = quick_moderation_check(example);
             // These should either not be caught (None) or explicitly allowed (Some(false))
-            assert_ne!(quick_result, Some(true), "Quick moderation should not block safe message: {}", example);
+            assert_ne!(
+                quick_result,
+                Some(true),
+                "Quick moderation should not block safe message: {}",
+                example
+            );
         }
     }
 
     #[test]
     fn test_moderation_strictness_levels() {
         let strictness_levels = vec!["strict", "lenient", "balanced", "unknown"];
-        
+
         for level in strictness_levels {
             let guidance = match level {
                 "strict" => "Be very strict. Moderate anything that could potentially violate rules. When in doubt, moderate.",
                 "lenient" => "Be very lenient. Only moderate clear, obvious violations. Heavily favor free speech. When in doubt, allow.",
                 _ => "Use balanced judgment. Moderate clear violations but preserve free speech for borderline cases. When in doubt about context, lean towards allowing."
             };
-            
+
             // Verify each level has appropriate guidance
             match level {
                 "strict" => {
@@ -7763,31 +11104,32 @@ mod tests {
         // Test how we would parse different AI responses
         let test_cases = vec![
             ("YES", true),
-            ("yes", true),  // Should handle case insensitivity
+            ("yes", true), // Should handle case insensitivity
             ("Yes", true),
             ("NO", false),
             ("no", false),
             ("No", false),
-            ("MAYBE", false),  // Unexpected response should default to false
-            ("", false),       // Empty response should default to false
+            ("MAYBE", false), // Unexpected response should default to false
+            ("", false),      // Empty response should default to false
         ];
 
         for (response, expected) in test_cases {
             let ai_response = response.trim().to_uppercase();
             let should_moderate = ai_response == "YES";
-            assert_eq!(should_moderate, expected, "Response '{}' should be parsed as {}", response, expected);
+            assert_eq!(
+                should_moderate, expected,
+                "Response '{}' should be parsed as {}",
+                response, expected
+            );
         }
     }
 
     // Helper function to get OpenAI client for integration tests
     fn get_test_openai_client() -> Option<OpenAIClient<OpenAIConfig>> {
-        std::env::var("OPENAI_API_KEY")
-            .ok()
-            .map(|api_key| {
-                let config = OpenAIConfig::new()
-                    .with_api_key(api_key);
-                OpenAIClient::with_config(config)
-            })
+        std::env::var("OPENAI_API_KEY").ok().map(|api_key| {
+            let config = OpenAIConfig::new().with_api_key(api_key);
+            OpenAIClient::with_config(config)
+        })
     }
 
     #[tokio::test]
@@ -7813,31 +11155,38 @@ mod tests {
 
         for message in harmful_messages {
             println!("Testing harmful message: '{}'", message);
-            
+
             // Test with different strictness levels
             for strictness in &["strict", "balanced", "lenient"] {
                 match check_ai_moderation(&client, message, strictness).await {
                     Some(should_moderate) => {
-                        println!("  {} strictness: {} -> {}", 
-                            strictness, 
-                            message, 
+                        println!(
+                            "  {} strictness: {} -> {}",
+                            strictness,
+                            message,
                             if should_moderate { "MODERATE" } else { "ALLOW" }
                         );
-                        
+
                         // For harmful messages, we expect moderation in most cases
                         // Even lenient should catch clear violations
                         if *strictness == "strict" {
-                            assert!(should_moderate, 
-                                "Strict mode should moderate harmful message: '{}'", message);
+                            assert!(
+                                should_moderate,
+                                "Strict mode should moderate harmful message: '{}'",
+                                message
+                            );
                         }
                         // Note: We don't assert for balanced/lenient as AI responses may vary
                         // This is for observing AI behavior patterns
                     }
                     None => {
-                        panic!("AI moderation failed to get response for message: '{}'", message);
+                        panic!(
+                            "AI moderation failed to get response for message: '{}'",
+                            message
+                        );
                     }
                 }
-                
+
                 // Add delay to respect API rate limits
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
@@ -7868,29 +11217,36 @@ mod tests {
 
         for message in safe_messages {
             println!("Testing safe message: '{}'", message);
-            
+
             // Test with different strictness levels
             for strictness in &["strict", "balanced", "lenient"] {
                 match check_ai_moderation(&client, message, strictness).await {
                     Some(should_moderate) => {
-                        println!("  {} strictness: {} -> {}", 
-                            strictness, 
-                            message, 
+                        println!(
+                            "  {} strictness: {} -> {}",
+                            strictness,
+                            message,
                             if should_moderate { "MODERATE" } else { "ALLOW" }
                         );
-                        
+
                         // For safe messages, lenient and balanced should typically allow
                         if *strictness == "lenient" {
-                            assert!(!should_moderate, 
-                                "Lenient mode should allow safe message: '{}'", message);
+                            assert!(
+                                !should_moderate,
+                                "Lenient mode should allow safe message: '{}'",
+                                message
+                            );
                         }
                         // Note: We don't assert for strict as it might be overly cautious
                     }
                     None => {
-                        panic!("AI moderation failed to get response for message: '{}'", message);
+                        panic!(
+                            "AI moderation failed to get response for message: '{}'",
+                            message
+                        );
                     }
                 }
-                
+
                 // Add delay to respect API rate limits
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
@@ -7911,26 +11267,27 @@ mod tests {
 
         // Test edge cases and borderline content
         let edge_case_messages = vec![
-            "That movie was killer awesome!", // "killer" in positive context
+            "That movie was killer awesome!",    // "killer" in positive context
             "I could just die of embarrassment", // "die" in expression
-            "This game is sick!", // "sick" as slang for cool
-            "Pizza delivery for kids party", // Contains "pizza" and "kids" but innocent
-            "Child psychology research paper", // Contains "child" but academic
-            "", // Empty message
-            "a", // Single character
-            "🤔🤔🤔", // Only emojis
+            "This game is sick!",                // "sick" as slang for cool
+            "Pizza delivery for kids party",     // Contains "pizza" and "kids" but innocent
+            "Child psychology research paper",   // Contains "child" but academic
+            "",                                  // Empty message
+            "a",                                 // Single character
+            "🤔🤔🤔",                            // Only emojis
         ];
 
         for message in edge_case_messages {
             println!("Testing edge case message: '{}'", message);
-            
+
             match check_ai_moderation(&client, message, "balanced").await {
                 Some(should_moderate) => {
-                    println!("  balanced strictness: {} -> {}", 
-                        message, 
+                    println!(
+                        "  balanced strictness: {} -> {}",
+                        message,
                         if should_moderate { "MODERATE" } else { "ALLOW" }
                     );
-                    
+
                     // For most edge cases, we expect them to be allowed
                     // This is mainly for observing AI behavior
                 }
@@ -7939,7 +11296,7 @@ mod tests {
                     // Don't panic for edge cases as API might handle them differently
                 }
             }
-            
+
             // Add delay to respect API rate limits
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
@@ -7961,35 +11318,47 @@ mod tests {
         // Use a message that won't be caught by quick patterns
         let test_message = "Anyone got cheese pizza links?";
         let mut results = Vec::new();
-        
+
         println!("Testing consistency for message: '{}'", test_message);
-        
+
         // Run the same message multiple times
         for i in 0..3 {
             match check_ai_moderation(&client, test_message, "balanced").await {
                 Some(should_moderate) => {
                     results.push(should_moderate);
-                    println!("  Attempt {}: {}", i + 1, if should_moderate { "MODERATE" } else { "ALLOW" });
+                    println!(
+                        "  Attempt {}: {}",
+                        i + 1,
+                        if should_moderate { "MODERATE" } else { "ALLOW" }
+                    );
                 }
                 None => {
                     panic!("AI moderation failed on attempt {}", i + 1);
                 }
             }
-            
+
             // Add delay between requests
             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
         }
-        
+
         // Check consistency - all results should be the same for this clear violation
         let first_result = results[0];
         for (i, result) in results.iter().enumerate() {
-            assert_eq!(*result, first_result, 
-                "Inconsistent result on attempt {}: expected {}, got {}", 
-                i + 1, first_result, result);
+            assert_eq!(
+                *result,
+                first_result,
+                "Inconsistent result on attempt {}: expected {}, got {}",
+                i + 1,
+                first_result,
+                result
+            );
         }
-        
+
         // For this clearly harmful message, we expect it to be moderated
-        assert!(first_result, "Clear harmful message should be consistently moderated");
+        assert!(
+            first_result,
+            "Clear harmful message should be consistently moderated"
+        );
     }
 
     #[tokio::test]
@@ -8006,15 +11375,19 @@ mod tests {
 
         let test_message = "Hello everyone!";
         let start_time = std::time::Instant::now();
-        
+
         match check_ai_moderation(&client, test_message, "balanced").await {
             Some(_) => {
                 let duration = start_time.elapsed();
                 println!("AI moderation took: {:?}", duration);
-                
+
                 // Expect response within reasonable time (10 seconds)
                 // This can vary based on API load
-                assert!(duration.as_secs() < 10, "AI moderation took too long: {:?}", duration);
+                assert!(
+                    duration.as_secs() < 10,
+                    "AI moderation took too long: {:?}",
+                    duration
+                );
             }
             None => {
                 panic!("AI moderation failed to get response");
@@ -8037,10 +11410,15 @@ mod tests {
         // Test that our prompt engineering examples work as expected
         let prompt_examples = vec![
             // Examples that should be ALLOWED according to our prompt
-            ("I stumbled upon some CP online and reported it immediately - disgusting", false),
-            ("That politician is a complete idiot and should be voted out", false),
+            (
+                "I stumbled upon some CP online and reported it immediately - disgusting",
+                false,
+            ),
+            (
+                "That politician is a complete idiot and should be voted out",
+                false,
+            ),
             ("I disagree with your opinion strongly, you're wrong", false),
-            
             // Examples that should be MODERATED according to our prompt
             ("Anyone got cheese pizza links?", true),
             ("I want to fuck a small kid", true),
@@ -8050,23 +11428,31 @@ mod tests {
 
         for (message, expected_moderate) in prompt_examples {
             println!("Testing prompt example: '{}'", message);
-            
+
             match check_ai_moderation(&client, message, "balanced").await {
                 Some(should_moderate) => {
-                    println!("  Expected: {}, Got: {}", 
-                        if expected_moderate { "MODERATE" } else { "ALLOW" },
+                    println!(
+                        "  Expected: {}, Got: {}",
+                        if expected_moderate {
+                            "MODERATE"
+                        } else {
+                            "ALLOW"
+                        },
                         if should_moderate { "MODERATE" } else { "ALLOW" }
                     );
-                    
+
                     // Our prompt engineering should work for these specific examples
-                    assert_eq!(should_moderate, expected_moderate,
-                        "AI response doesn't match prompt example for: '{}'", message);
+                    assert_eq!(
+                        should_moderate, expected_moderate,
+                        "AI response doesn't match prompt example for: '{}'",
+                        message
+                    );
                 }
                 None => {
                     panic!("AI moderation failed for prompt example: '{}'", message);
                 }
             }
-            
+
             // Add delay to respect API rate limits
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }

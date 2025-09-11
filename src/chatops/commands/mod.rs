@@ -1,7 +1,9 @@
-pub mod doc;
-pub mod tools;
-pub mod chat;
+pub mod account;
 pub mod ai;
+pub mod chat;
+pub mod doc;
 pub mod github;
-pub mod network;
 pub mod misc;
+pub mod network;
+pub mod notes;
+pub mod tools;

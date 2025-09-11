@@ -30,22 +30,25 @@ impl ChatOpResult {
             ChatOpResult::Error(err) => vec![format!("❌ Error: {}", err)],
         }
     }
-    
+
     /// Check if result should be truncated for chat
     pub fn should_truncate(&self, max_lines: usize) -> bool {
         self.to_messages().len() > max_lines
     }
-    
+
     /// Truncate result for chat output
     pub fn truncate(&self, max_lines: usize) -> ChatOpResult {
         let messages = self.to_messages();
         if messages.len() <= max_lines {
             return self.clone();
         }
-        
+
         let message_count = messages.len();
         let mut truncated = messages.into_iter().take(max_lines - 1).collect::<Vec<_>>();
-        truncated.push(format!("... ({} more lines truncated)", message_count - max_lines + 1));
+        truncated.push(format!(
+            "... ({} more lines truncated)",
+            message_count - max_lines + 1
+        ));
         ChatOpResult::Block(truncated)
     }
 }

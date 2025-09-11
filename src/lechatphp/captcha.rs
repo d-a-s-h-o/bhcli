@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet};
-use std::fmt::{Display, Formatter};
-use std::hash::Hash;
 use base64::{engine::general_purpose, Engine as _};
 use bresenham::Bresenham;
 use image::{DynamicImage, GenericImageView, Rgba};
 use lazy_static::lazy_static;
+use std::collections::{HashMap, HashSet};
+use std::fmt::{Display, Formatter};
+use std::hash::Hash;
 
 const B64_PREFIX: &'static str = "R0lGODlhCAAOAIAAAAAAAAAAACH5BAgAAAAALAAAAAAIAA4AgAQCBPz+/AI";
 // list of letters that contains other letters: (h, n) (I, l) (y, u) (Q, O) (B, 3) (E, L) (R, P)
@@ -13,7 +13,7 @@ const ALPHABET1: &'static str = "abdcefgh1ijkImnpoqrstyQuvwxzABCDEGJKMNHLORPFSTl
 const LETTER_WIDTH: u32 = 8;
 const LETTER_HEIGHT: u32 = 14;
 const NB_CHARS: u32 = 5;
-const LEFT_PADDING: u32 = 5;  // left padding for difficulty 1 and 2
+const LEFT_PADDING: u32 = 5; // left padding for difficulty 1 and 2
 const TOP_PADDING: u32 = 7; // top padding for difficulty 1 and 2
 
 lazy_static! {
@@ -86,13 +86,19 @@ lazy_static! {
 }
 
 fn get_letter_img(letter: char) -> DynamicImage {
-    let b64_suffix = B64_MAP.get(&letter).expect(format!("letter image not found for {}", letter).as_str());
-    let img_dec = general_purpose::STANDARD.decode(format!("{}{}", B64_PREFIX, b64_suffix)).unwrap();
+    let b64_suffix = B64_MAP
+        .get(&letter)
+        .expect(format!("letter image not found for {}", letter).as_str());
+    let img_dec = general_purpose::STANDARD
+        .decode(format!("{}{}", B64_PREFIX, b64_suffix))
+        .unwrap();
     image::load_from_memory(&img_dec).unwrap()
 }
 
 pub fn solve_b64(b64_str: &str) -> Option<String> {
-    let img_dec = general_purpose::STANDARD.decode(b64_str.strip_prefix("data:image/gif;base64,")?).ok()?;
+    let img_dec = general_purpose::STANDARD
+        .decode(b64_str.strip_prefix("data:image/gif;base64,")?)
+        .ok()?;
     let img = image::load_from_memory(&img_dec).ok()?;
     if img.width() > 60 {
         return match solve_difficulty3(&img) {
@@ -100,7 +106,7 @@ pub fn solve_b64(b64_str: &str) -> Option<String> {
             Err(e) => {
                 println!("{:?}", e);
                 None
-            },
+            }
         };
     }
     solve_difficulty2(&img)
@@ -110,7 +116,12 @@ pub fn solve_b64(b64_str: &str) -> Option<String> {
 fn solve_difficulty2(img: &DynamicImage) -> Option<String> {
     let mut answer = String::new();
     for i in 0..NB_CHARS {
-        let sub_img = img.crop_imm(LEFT_PADDING + ((LETTER_WIDTH +1)*i), TOP_PADDING, LETTER_WIDTH, LETTER_HEIGHT);
+        let sub_img = img.crop_imm(
+            LEFT_PADDING + ((LETTER_WIDTH + 1) * i),
+            TOP_PADDING,
+            LETTER_WIDTH,
+            LETTER_HEIGHT,
+        );
         for c in ALPHABET1.chars() {
             if img_contains_letter(&sub_img, c) {
                 answer.push(c);
@@ -138,7 +149,10 @@ impl Letter {
 
     fn center(&self) -> Point {
         let offset = self.offset();
-        Point::new(offset.x + LETTER_WIDTH/2, offset.y + LETTER_HEIGHT/2 - 1)
+        Point::new(
+            offset.x + LETTER_WIDTH / 2,
+            offset.y + LETTER_HEIGHT / 2 - 1,
+        )
     }
 }
 
@@ -202,13 +216,14 @@ fn find_letters(img: &DynamicImage) -> Result<HashSet<Letter>, CaptchaErr> {
     const IMAGE_HEIGHT: u32 = 200;
     const MIN_PX_FOR_LETTER: usize = 21;
     let mut letters_set = HashSet::new();
-    for y in 0..IMAGE_HEIGHT-LETTER_HEIGHT {
-        for x in 0..IMAGE_WIDTH-LETTER_WIDTH {
+    for y in 0..IMAGE_HEIGHT - LETTER_HEIGHT {
+        for x in 0..IMAGE_WIDTH - LETTER_WIDTH {
             let letter_img = img.crop_imm(x, y, LETTER_WIDTH, LETTER_HEIGHT);
             // We know that minimum amount of pixels on to form a letter is 21
             // We can skip squares that do not have this prerequisite
             // Check middle pixels for red, if no red pixels, we can ignore that square
-            if count_px_on(&letter_img) < MIN_PX_FOR_LETTER || !has_red_in_center_area(&letter_img) {
+            if count_px_on(&letter_img) < MIN_PX_FOR_LETTER || !has_red_in_center_area(&letter_img)
+            {
                 continue;
             }
             'alphabet_loop: for c in ALPHABET1.chars() {
@@ -216,7 +231,7 @@ fn find_letters(img: &DynamicImage) -> Result<HashSet<Letter>, CaptchaErr> {
                     continue;
                 }
                 // "w" fits in "W". So if we find "W" 1 px bellow, discard "w"
-                for (a, b, x, y) in vec![('w', 'W', x, y+1), ('k', 'K', x+1, y+1)] {
+                for (a, b, x, y) in vec![('w', 'W', x, y + 1), ('k', 'K', x + 1, y + 1)] {
                     if c == a {
                         let one_px_down_img = img.crop_imm(x, y, LETTER_WIDTH, LETTER_HEIGHT);
                         if img_contains_letter(&one_px_down_img, b) {
@@ -230,15 +245,26 @@ fn find_letters(img: &DynamicImage) -> Result<HashSet<Letter>, CaptchaErr> {
         }
     }
     if letters_set.len() != NB_CHARS as usize {
-        return Err(CaptchaErr(format!("did not find exactly 5 letters {}", letters_set.len())));
+        return Err(CaptchaErr(format!(
+            "did not find exactly 5 letters {}",
+            letters_set.len()
+        )));
     }
     Ok(letters_set)
 }
 
-fn get_starting_letter<'a>(img: &DynamicImage, letters_set: &'a HashSet<Letter>) -> Option<&'a Letter> {
+fn get_starting_letter<'a>(
+    img: &DynamicImage,
+    letters_set: &'a HashSet<Letter>,
+) -> Option<&'a Letter> {
     const MIN_STARTING_PT_RED_PX: usize = 50;
     for letter in letters_set.iter() {
-        let square = img.crop_imm(letter.offset.x-5, letter.offset.y-3, LETTER_WIDTH+5+6, LETTER_HEIGHT+3+2);
+        let square = img.crop_imm(
+            letter.offset.x - 5,
+            letter.offset.y - 3,
+            LETTER_WIDTH + 5 + 6,
+            LETTER_HEIGHT + 3 + 2,
+        );
         let count_red = count_red_px(&square);
         if count_red > MIN_STARTING_PT_RED_PX {
             return Some(letter);
@@ -255,7 +281,7 @@ struct Point {
 
 impl Point {
     fn new(x: u32, y: u32) -> Self {
-        Self{x, y}
+        Self { x, y }
     }
 }
 
@@ -293,21 +319,18 @@ fn is_red(c: Rgba<u8>) -> bool {
 }
 
 fn has_red_in_center_area(letter_img: &DynamicImage) -> bool {
-    letter_img.view(LETTER_WIDTH/2 - 1, LETTER_HEIGHT/2 - 1, 2, 2)
+    letter_img
+        .view(LETTER_WIDTH / 2 - 1, LETTER_HEIGHT / 2 - 1, 2, 2)
         .pixels()
         .any(|(_, _, c)| is_red(c))
 }
 
 // Count pixels that are On (either white or red)
 fn count_px_on(img: &DynamicImage) -> usize {
-    img.pixels()
-        .filter(|(_, _, c)| is_on(*c))
-        .count()
+    img.pixels().filter(|(_, _, c)| is_on(*c)).count()
 }
 
 // Count pixels that are red
 fn count_red_px(img: &DynamicImage) -> usize {
-    img.pixels()
-        .filter(|(_, _, c)| is_red(*c))
-        .count()
+    img.pixels().filter(|(_, _, c)| is_red(*c)).count()
 }

@@ -1,5 +1,5 @@
+use crate::chatops::{ChatCommand, ChatOpError, ChatOpResult, CommandContext, UserRole};
 use std::collections::HashMap;
-use crate::chatops::{ChatCommand, CommandContext, UserRole, ChatOpResult, ChatOpError};
 
 /// Registry for managing ChatOps commands
 pub struct CommandRegistry {
@@ -14,26 +14,26 @@ impl CommandRegistry {
             aliases: HashMap::new(),
         }
     }
-    
+
     /// Register a new command
     pub fn register(&mut self, command: Box<dyn ChatCommand>) {
         let name = command.name().to_string();
-        
+
         // Register aliases
         for alias in command.aliases() {
             self.aliases.insert(alias.to_string(), name.clone());
         }
-        
+
         self.commands.insert(name, command);
     }
-    
+
     /// Get command by name or alias
     pub fn get_command(&self, name: &str) -> Option<&dyn ChatCommand> {
         let actual_name = name.to_string();
         let command_name = self.aliases.get(name).unwrap_or(&actual_name);
         self.commands.get(command_name).map(|cmd| cmd.as_ref())
     }
-    
+
     /// Execute a command with arguments
     pub fn execute_command(
         &self,
@@ -45,17 +45,19 @@ impl CommandRegistry {
             Some(command) => {
                 // Check permissions
                 if !self.check_permission(&context.role, &command.required_role()) {
-                    return Err(ChatOpError::PermissionDenied(
-                        format!("Command '{}' requires {:?} role or higher", name, command.required_role())
-                    ));
+                    return Err(ChatOpError::PermissionDenied(format!(
+                        "Command '{}' requires {:?} role or higher",
+                        name,
+                        command.required_role()
+                    )));
                 }
-                
+
                 command.execute(args, context)
             }
             None => Err(ChatOpError::Generic(format!("Unknown command: {}", name))),
         }
     }
-    
+
     /// List all available commands for a user role
     pub fn list_commands(&self, role: &UserRole) -> Vec<(&str, &str)> {
         self.commands
@@ -64,7 +66,7 @@ impl CommandRegistry {
             .map(|cmd| (cmd.name(), cmd.description()))
             .collect()
     }
-    
+
     /// Get help for a specific command
     pub fn get_help(&self, name: &str) -> Option<String> {
         self.get_command(name).map(|cmd| {
@@ -81,14 +83,14 @@ impl CommandRegistry {
             )
         })
     }
-    
+
     /// Check if user role has permission for required role
     fn check_permission(&self, user_role: &UserRole, required_role: &UserRole) -> bool {
         let user_level = self.role_level(user_role);
         let required_level = self.role_level(required_role);
         user_level >= required_level
     }
-    
+
     /// Convert role to numeric level for comparison
     fn role_level(&self, role: &UserRole) -> u8 {
         match role {
@@ -98,7 +100,7 @@ impl CommandRegistry {
             UserRole::Admin => 3,
         }
     }
-    
+
     /// Register a user alias for a command
     #[allow(dead_code)]
     pub fn register_alias(&mut self, alias: String, target: String) {
@@ -106,7 +108,7 @@ impl CommandRegistry {
             self.aliases.insert(alias, target);
         }
     }
-    
+
     /// Remove a user alias
     #[allow(dead_code)]
     pub fn remove_alias(&mut self, alias: &str) {

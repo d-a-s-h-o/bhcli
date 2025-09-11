@@ -13,7 +13,9 @@ impl Reason {
         match self {
             Reason::RacialSlur => "using a racial slur (sorry if this is false)",
             Reason::CsabTalk => "referencing child sexual abuse material (sorry if this is false)",
-            Reason::CsabRequest => "requesting child sexual abuse material (sorry if this is false)",
+            Reason::CsabRequest => {
+                "requesting child sexual abuse material (sorry if this is false)"
+            }
         }
     }
 }
@@ -58,12 +60,22 @@ pub fn score_message(message: &str) -> ScoreResult {
     }
 
     // Detect CSAM related talk (various obfuscations)
-    let csam_terms = ["csam", "childporn", "pedo", "chees pizza", "childsex", "childsexualabuse", "cp"];
-    if csam_terms.iter().any(|t| msg.contains(t) || normalized.contains(t)) {
-        let request_re = Regex::new(
-            r"\b(send|share|looking|where|has|download|anyone|link|give|provide)\b",
-        )
-        .unwrap();
+    let csam_terms = [
+        "csam",
+        "childporn",
+        "pedo",
+        "chees pizza",
+        "childsex",
+        "childsexualabuse",
+        "cp",
+    ];
+    if csam_terms
+        .iter()
+        .any(|t| msg.contains(t) || normalized.contains(t))
+    {
+        let request_re =
+            Regex::new(r"\b(send|share|looking|where|has|download|anyone|link|give|provide)\b")
+                .unwrap();
         if request_re.is_match(&msg) {
             score = score.max(90);
             reason = Some(Reason::CsabRequest);

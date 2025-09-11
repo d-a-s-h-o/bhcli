@@ -130,6 +130,9 @@ pub fn login(
                     .spawn()
                     .expect("Failed to open image with sxiv");
 
+                // Wait for the process to prevent zombie processes
+                let _ = sxiv_process.wait();
+
                 // Prompt the user to enter the CAPTCHA
                 print!("Please enter the CAPTCHA: ");
                 io::stdout().flush().unwrap();

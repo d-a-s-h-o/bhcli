@@ -53,7 +53,7 @@ impl<T> StatefulList<T> {
         self.state.select(None);
     }
 
-     pub fn select_top(&mut self) {
+    pub fn select_top(&mut self) {
         if self.items.is_empty() {
             return;
         }
