@@ -2488,6 +2488,13 @@ Connection:
                 modifiers: KeyModifiers::SHIFT,
                 ..
             } => {
+                self.handle_normal_mode_key_event_translate(app, messages);
+            }
+            KeyEvent {
+                code: KeyCode::Char('N'),
+                modifiers: KeyModifiers::SHIFT,
+                ..
+            } => {
                 app.enter_notes_mode(self);
             }
             KeyEvent {
@@ -2589,22 +2596,12 @@ Connection:
                 ..
             } => self.handle_editing_mode_key_event_ctrl_v(app),
             KeyEvent {
-                code: KeyCode::Char('.'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => self.handle_editing_mode_key_event_external_editor(app, users)?,
-            KeyEvent {
                 code: KeyCode::Char('x'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
                 app.enter_message_editor_mode();
             }
-            KeyEvent {
-                code: KeyCode::Char('o'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => self.handle_editing_mode_key_event_external_editor(app, users)?,
             KeyEvent {
                 code: KeyCode::Char('l'),
                 modifiers: KeyModifiers::CONTROL,
@@ -4065,22 +4062,12 @@ Connection:
                 ..
             } => self.handle_editing_mode_key_event_ctrl_v(app),
             KeyEvent {
-                code: KeyCode::Char('.'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => self.handle_editing_mode_key_event_external_editor(app, users)?,
-            KeyEvent {
                 code: KeyCode::Char('x'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => {
                 app.enter_message_editor_mode();
             }
-            KeyEvent {
-                code: KeyCode::Char('o'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } => self.handle_editing_mode_key_event_external_editor(app, users)?,
             KeyEvent {
                 code: KeyCode::Left,
                 modifiers: KeyModifiers::NONE,
