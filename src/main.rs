@@ -55,6 +55,7 @@ use regex::Regex;
 use reqwest::blocking::multipart;
 use reqwest::blocking::Client;
 use reqwest::redirect::Policy;
+#[cfg(feature = "audio")]
 use rodio::{source::Source, Decoder, OutputStream};
 use select::document::Document;
 use select::predicate::{Attr, Name};
@@ -259,6 +260,10 @@ struct Opts {
     bot_admins: Vec<String>,
     #[arg(long)]
     bot_data_dir: Option<String>,
+
+    // Use 404 chatroom profile
+    #[arg(long = "404")]
+    use_404: bool,
 }
 
 struct LeChatPHPConfig {
@@ -276,6 +281,17 @@ impl LeChatPHPConfig {
             url: "http://blkhatjxlrvc5aevqzz5t6kxldayog6jlx5h7glnu44euzongl4fh5ad.onion".to_owned(),
             datetime_fmt: "%m-%d %H:%M:%S".to_owned(),
             page_php: "chat.php".to_owned(),
+            keepalive_send_to: "0".to_owned(),
+            members_tag: "[M] ".to_owned(),
+            staffs_tag: "[Staff] ".to_owned(),
+        }
+    }
+
+    fn new_404_chatroom_not_found_config() -> Self {
+        Self {
+            url: "http://4o4o4hn4hsujpnbsso7tqigujuokafxys62thulbk2k3mf46vq22qfqd.onion/chat/min".to_owned(),
+            datetime_fmt: "%Y-%m-%d %H:%M:%S".to_owned(),
+            page_php: "index.php".to_owned(),
             keepalive_send_to: "0".to_owned(),
             members_tag: "[M] ".to_owned(),
             staffs_tag: "[Staff] ".to_owned(),
@@ -553,7 +569,11 @@ impl LeChatPHPClient {
         let ai_service = Arc::clone(&self.ai_service);
         let bot_manager = self.bot_manager.clone();
         thread::spawn(move || {
-            let (_stream, stream_handle) = OutputStream::try_default().unwrap();
+            #[cfg(feature = "audio")]
+            let audio_output = OutputStream::try_default().ok();
+            #[cfg(feature = "audio")]
+            let stream_handle = audio_output.as_ref().map(|(_, handle)| handle);
+
             loop {
                 let mut should_notify = false;
 
@@ -595,9 +615,13 @@ impl LeChatPHPClient {
 
                 let muted = { *is_muted.lock().unwrap() };
                 if should_notify && !muted {
-                    let source = Decoder::new_mp3(Cursor::new(SOUND1)).unwrap();
-                    if let Err(err) = stream_handle.play_raw(source.convert_samples()) {
-                        log::error!("{}", err);
+                    #[cfg(feature = "audio")]
+                    if let Some(handle) = &stream_handle {
+                        if let Ok(source) = Decoder::new_mp3(Cursor::new(SOUND1)) {
+                            if let Err(err) = handle.play_raw(source.convert_samples()) {
+                                log::error!("Audio playback error: {}", err);
+                            }
+                        }
                     }
                 }
 
@@ -647,7 +671,8 @@ impl LeChatPHPClient {
         let (events, h4) = Events::with_config(Config {
             messages_updated_rx,
             exit_rx: sig.lock().unwrap().clone(),
-            tick_rate: Duration::from_millis(250),
+            // Increased from 250ms to 500ms to reduce CPU usage significantly
+            tick_rate: Duration::from_millis(500),
         });
 
         loop {
@@ -1864,7 +1889,7 @@ impl LeChatPHPClient {
                 format!("@{}", msg)
             };
             let end_msg = format!(
-                "This is your warning - {}, will be kicked next. Please read the !-rules / https://4-0-4.io/bhc-rules",
+                "This is your warning - {}, will be kicked next. Please read the !-rules.",
                 msg
             );
             self.post_msg(PostType::Post(end_msg, None)).unwrap();
@@ -3581,295 +3606,6 @@ Connection:
             app.input.insert_str(byte_position, &clipboard);
             app.input_idx += clipboard.chars().count();
         }
-    }
-
-    fn handle_editing_mode_key_event_external_editor(
-        &mut self,
-        app: &mut App,
-        users: &Arc<Mutex<Users>>,
-    ) -> Result<(), ExitSignal> {
-        use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-        use crossterm::{
-            execute,
-            terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
-        };
-        use std::fs;
-        use std::io::{stdout, Write};
-        use std::process::{Command, Stdio};
-        use tempfile::NamedTempFile;
-
-        // Create a temporary file with .txt extension for better editor recognition
-        let mut temp_file = match NamedTempFile::with_suffix(".txt") {
-            Ok(file) => file,
-            Err(e) => {
-                log::error!("Failed to create temp file: {}", e);
-                return Ok(());
-            }
-        };
-
-        // Write current input content to the temp file
-        if !app.input.is_empty() {
-            if let Err(e) = temp_file.write_all(app.input.as_bytes()) {
-                log::error!("Failed to write to temp file: {}", e);
-                return Ok(());
-            }
-            if let Err(e) = temp_file.flush() {
-                log::error!("Failed to flush temp file: {}", e);
-                return Ok(());
-            }
-        }
-
-        // Get the temp file path and keep temp_file alive
-        let temp_path = match temp_file.path().to_str() {
-            Some(path) => path.to_string(),
-            None => {
-                log::error!("Failed to get temp file path");
-                return Ok(());
-            }
-        };
-
-        // Save the current input to restore if editor fails
-        let original_input = app.input.clone();
-        let original_input_idx = app.input_idx;
-
-        // Completely shut down the TUI application first
-        let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen, Clear(ClearType::All));
-        let _ = stdout().flush();
-
-        // Print a clear message to the terminal
-        println!("\n🚀 Launching external editor...\n");
-
-        // Determine which editor to use
-        let editor = std::env::var("EDITOR").unwrap_or_else(|_| {
-            for editor in &["nvim", "vim", "nano", "vi"] {
-                if Command::new("which")
-                    .arg(editor)
-                    .output()
-                    .map_or(false, |o| o.status.success())
-                {
-                    return editor.to_string();
-                }
-            }
-            "vi".to_string()
-        });
-
-        // Launch the editor as a completely independent process
-        // Give the editor complete control of the terminal
-        let status = Command::new(&editor)
-            .arg(&temp_path)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status();
-
-        // Editor has finished - immediately restart TUI without waiting for input
-        // Editor has finished - immediately restart TUI without waiting for input
-        println!("📝 Editor closed. Returning to chat...\n");
-
-        // Small delay to let user see the message
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        // Immediately restart the TUI - no user input required
-        if let Err(e) = enable_raw_mode() {
-            log::error!("Failed to re-enable raw mode: {}", e);
-        }
-        if let Err(e) = execute!(stdout(), EnterAlternateScreen) {
-            log::error!("Failed to enter alternate screen: {}", e);
-        }
-
-        // Force a complete screen refresh
-        if let Err(e) = execute!(stdout(), Clear(ClearType::All)) {
-            log::error!("Failed to clear screen: {}", e);
-        }
-        if let Err(e) = stdout().flush() {
-            log::error!("Failed to flush stdout: {}", e);
-        }
-
-        // Process the editor results
-        match status {
-            Ok(exit_status) if exit_status.success() => {
-                // Read and process the edited content
-                match fs::read_to_string(&temp_path) {
-                    Ok(content) => {
-                        let content = content.trim_end().to_string();
-
-                        if !content.is_empty() {
-                            // Add to history if not empty
-                            app.add_to_history(content.clone());
-
-                            // Process and send the message directly
-                            let mut processed_content = replace_newline_escape(&content);
-
-                            // Check for commands and execute them
-                            for (command, action) in &app.commands.commands {
-                                let expected_input = format!("!{}", command);
-                                if processed_content == expected_input {
-                                    if let Err(e) =
-                                        self.post_msg(PostType::Post(action.clone(), None))
-                                    {
-                                        log::error!("Failed to send command from editor: {}", e);
-                                    }
-                                    app.input.clear();
-                                    app.input_idx = 0;
-                                    app.input_mode = InputMode::Normal;
-                                    return Ok(());
-                                }
-                            }
-
-                            // Handle prefixes and process commands
-                            let mut members_prefix = false;
-                            let mut staffs_prefix = false;
-                            let mut admin_prefix = false;
-                            let mut pm_target: Option<String> = None;
-
-                            // Check for /pm prefix first
-                            if let Some(captures) = PM_RGX.captures(&processed_content) {
-                                pm_target = Some(captures[1].to_string());
-                                processed_content = captures[2].to_string();
-                            } else if processed_content.starts_with("/m ") {
-                                members_prefix = true;
-                                processed_content =
-                                    processed_content.strip_prefix("/m ").unwrap().to_string();
-                            } else if processed_content.starts_with("/s ") {
-                                staffs_prefix = true;
-                                processed_content =
-                                    processed_content.strip_prefix("/s ").unwrap().to_string();
-                            } else if processed_content.starts_with("/a ") {
-                                admin_prefix = true;
-                                processed_content =
-                                    processed_content.strip_prefix("/a ").unwrap().to_string();
-                            }
-
-                            // Determine target for ChatOps commands
-                            let chatops_target = if let Some(user) = pm_target.clone() {
-                                Some(user)
-                            } else if members_prefix {
-                                Some(SEND_TO_MEMBERS.to_owned())
-                            } else if staffs_prefix {
-                                Some(SEND_TO_STAFFS.to_owned())
-                            } else if admin_prefix {
-                                Some(SEND_TO_ADMINS.to_owned())
-                            } else {
-                                None
-                            };
-
-                            // Try to process as ChatOps command
-                            if self.process_command_with_target(
-                                &processed_content,
-                                app,
-                                users,
-                                chatops_target.clone(),
-                            ) {
-                                // Command was processed successfully
-                                if let Some(user) = pm_target {
-                                    app.input = format!("/pm {} ", user);
-                                    app.input_idx = app.input.width();
-                                } else if members_prefix {
-                                    app.input = "/m ".to_owned();
-                                    app.input_idx = app.input.width();
-                                } else if staffs_prefix {
-                                    app.input = "/s ".to_owned();
-                                    app.input_idx = app.input.width();
-                                } else if admin_prefix {
-                                    app.input = "/a ".to_owned();
-                                    app.input_idx = app.input.width();
-                                } else {
-                                    app.input.clear();
-                                    app.input_idx = 0;
-                                    app.input_mode = InputMode::Normal;
-                                }
-                                return Ok(());
-                            }
-
-                            // Send as regular message with appropriate target
-                            if let Some(user) = pm_target {
-                                if let Err(e) = self
-                                    .post_msg(PostType::Post(processed_content, Some(user.clone())))
-                                {
-                                    log::error!("Failed to send PM from editor: {}", e);
-                                }
-                                app.input = format!("/pm {} ", user);
-                                app.input_idx = app.input.width();
-                            } else if members_prefix {
-                                if let Err(e) = self.post_msg(PostType::Post(
-                                    processed_content,
-                                    Some(SEND_TO_MEMBERS.to_owned()),
-                                )) {
-                                    log::error!("Failed to send message to members: {}", e);
-                                }
-                                app.input = "/m ".to_owned();
-                                app.input_idx = app.input.width();
-                            } else if staffs_prefix {
-                                if let Err(e) = self.post_msg(PostType::Post(
-                                    processed_content,
-                                    Some(SEND_TO_STAFFS.to_owned()),
-                                )) {
-                                    log::error!("Failed to send message to staffs: {}", e);
-                                }
-                                app.input = "/s ".to_owned();
-                                app.input_idx = app.input.width();
-                            } else if admin_prefix {
-                                if let Err(e) = self.post_msg(PostType::Post(
-                                    processed_content,
-                                    Some(SEND_TO_ADMINS.to_owned()),
-                                )) {
-                                    log::error!("Failed to send message to admins: {}", e);
-                                }
-                                app.input = "/a ".to_owned();
-                                app.input_idx = app.input.width();
-                            } else {
-                                if processed_content.starts_with("/")
-                                    && !processed_content.starts_with("/me ")
-                                {
-                                    // Invalid command - put it back in input with error state
-                                    app.input = processed_content;
-                                    app.input_idx = app.input.chars().count();
-                                    app.input_mode = InputMode::EditingErr;
-                                } else {
-                                    // Send as regular message
-                                    if let Err(e) =
-                                        self.post_msg(PostType::Post(processed_content, None))
-                                    {
-                                        log::error!("Failed to send message from editor: {}", e);
-                                    }
-                                    app.input.clear();
-                                    app.input_idx = 0;
-                                    app.input_mode = InputMode::Normal;
-                                }
-                            }
-                        } else {
-                            // Empty content - just go back to normal mode
-                            app.input.clear();
-                            app.input_idx = 0;
-                            app.input_mode = InputMode::Normal;
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Failed to read edited file: {}", e);
-                        // Restore original input on read error
-                        app.input = original_input;
-                        app.input_idx = original_input_idx;
-                    }
-                }
-            }
-            Ok(_) => {
-                // Editor was cancelled/failed - restore original input
-                app.input = original_input;
-                app.input_idx = original_input_idx;
-            }
-            Err(e) => {
-                log::error!("Failed to launch editor {}: {}", editor, e);
-                // Restore original input on launch error
-                app.input = original_input;
-                app.input_idx = original_input_idx;
-            }
-        }
-
-        // Ensure we're back in the correct state
-        app.input_mode = InputMode::Editing;
-
-        Ok(())
     }
 
     fn handle_editing_mode_key_event_newline(&mut self, app: &mut App) {
@@ -6437,7 +6173,11 @@ fn new_default_le_chat_php_client(params: Params) -> LeChatPHPClient {
         manual_captcha: params.manual_captcha,
         sxiv: params.sxiv,
         refresh_rate: params.refresh_rate,
-        config: LeChatPHPConfig::new_black_hat_chat_config(),
+        config: if params.profile == "404_chatroom" {
+            LeChatPHPConfig::new_404_chatroom_not_found_config()
+        } else {
+            LeChatPHPConfig::new_black_hat_chat_config()
+        },
         is_muted: Arc::new(Mutex::new(false)),
         show_sys: false,
         display_guest_view: false,
@@ -6611,7 +6351,7 @@ fn get_guest_color(wanted: Option<String>) -> String {
 }
 
 fn get_tor_client(socks_proxy_url: &str, no_proxy: bool) -> Client {
-    let ua = "Dasho's Black Hat Chat Client v0.2-Epic";
+    let ua = "Dasho's Black Hat Chat Client v1.0-Epic";
     let mut builder = reqwest::blocking::ClientBuilder::new()
         .redirect(Policy::none())
         .cookie_store(true)
@@ -6658,7 +6398,11 @@ fn start_dkf_notifier(client: &Client, dkf_api_key: &str) {
     let dkf_api_key = dkf_api_key.to_owned();
     let mut last_known_date = Utc::now();
     thread::spawn(move || {
-        let (_stream, stream_handle) = OutputStream::try_default().unwrap();
+        #[cfg(feature = "audio")]
+        let audio_output = OutputStream::try_default().ok();
+        #[cfg(feature = "audio")]
+        let stream_handle = audio_output.as_ref().map(|(_, handle)| handle);
+
         loop {
             let params: Vec<(&str, String)> = vec![(
                 "last_known_date",
@@ -6674,8 +6418,12 @@ fn start_dkf_notifier(client: &Client, dkf_api_key: &str) {
                 if let Ok(txt) = resp.text() {
                     if let Ok(v) = serde_json::from_str::<DkfNotifierResp>(&txt) {
                         if v.pm_sound || v.tagged_sound {
-                            let source = Decoder::new_mp3(Cursor::new(SOUND1)).unwrap();
-                            stream_handle.play_raw(source.convert_samples()).unwrap();
+                            #[cfg(feature = "audio")]
+                            if let Some(handle) = &stream_handle {
+                                if let Ok(source) = Decoder::new_mp3(Cursor::new(SOUND1)) {
+                                    let _ = handle.play_raw(source.convert_samples());
+                                }
+                            }
                         }
                         last_known_date = DateTime::parse_from_rfc3339(&v.last_message_created_at)
                             .unwrap()
@@ -6696,7 +6444,11 @@ fn start_dnmx_mail_notifier(client: &Client, username: &str, password: &str) {
 
     let client_clone = client.clone();
     thread::spawn(move || {
-        let (_stream, stream_handle) = OutputStream::try_default().unwrap();
+        #[cfg(feature = "audio")]
+        let audio_output = OutputStream::try_default().ok();
+        #[cfg(feature = "audio")]
+        let stream_handle = audio_output.as_ref().map(|(_, handle)| handle);
+
         loop {
             let right_url = format!("{}/src/right_main.php", DNMX_URL);
             if let Ok(resp) = client_clone.get(right_url).send() {
@@ -6713,8 +6465,12 @@ fn start_dnmx_mail_notifier(client: &Client, username: &str, password: &str) {
                 }
                 if nb_mails > 0 {
                     log::error!("{} new mails", nb_mails);
-                    let source = Decoder::new_mp3(Cursor::new(SOUND1)).unwrap();
-                    stream_handle.play_raw(source.convert_samples()).unwrap();
+                    #[cfg(feature = "audio")]
+                    if let Some(handle) = &stream_handle {
+                        if let Ok(source) = Decoder::new_mp3(Cursor::new(SOUND1)) {
+                            let _ = handle.play_raw(source.convert_samples());
+                        }
+                    }
                 }
             }
             thread::sleep(Duration::from_secs(60));
@@ -6752,8 +6508,50 @@ fn read_commands_file(file_path: &str) -> Result<Commands, Box<dyn std::error::E
     Ok(commands)
 }
 
+// Install man page on first run
+fn install_manpage() -> anyhow::Result<()> {
+    const MANPAGE_CONTENT: &str = include_str!("../manpage/bhcli.1");
+
+    let home = std::env::var("HOME")?;
+    let man_dir = format!("{}/.local/share/man/man1", home);
+    let man_path = format!("{}/bhcli.1", man_dir);
+
+    // Check if man page already exists
+    if std::path::Path::new(&man_path).exists() {
+        return Ok(());
+    }
+
+    // Create directory if it doesn't exist
+    std::fs::create_dir_all(&man_dir)?;
+
+    // Write man page
+    std::fs::write(&man_path, MANPAGE_CONTENT)?;
+
+    // Update man database (try both user and system mandb commands)
+    // Ignore errors if mandb fails (it's not critical)
+    let _ = Command::new("mandb")
+        .arg("-u")
+        .arg(&format!("{}/.local/share/man", home))
+        .output();
+
+    println!("Man page installed to {}", man_path);
+    println!("Access it anytime with: man bhcli");
+    println!();
+
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
+    // Install man page on first run
+    let _ = install_manpage();
+
     let mut opts: Opts = Opts::parse();
+    
+    // If --404 flag is set, use the 404_chatroom profile
+    if opts.use_404 {
+        opts.profile = "404_chatroom".to_string();
+    }
+    
     // println!("Parsed Session: {:?}", opts.session);
 
     // Configs file
@@ -9077,33 +8875,6 @@ impl App {
         }
         
         pos
-    }
-    
-    // Helper function to search for text in content
-    fn search_in_content(content: &[String], query: &str, start_line: usize, start_col: usize) -> Option<(usize, usize)> {
-        if query.is_empty() {
-            return None;
-        }
-        
-        // Search from current position forward
-        for (line_idx, line) in content.iter().enumerate().skip(start_line) {
-            let search_start = if line_idx == start_line { start_col } else { 0 };
-            
-            if let Some(col_idx) = line[search_start..].find(query) {
-                return Some((line_idx, search_start + col_idx));
-            }
-        }
-        
-        // Wrap around to beginning if not found
-        for (line_idx, line) in content.iter().enumerate().take(start_line + 1) {
-            let search_end = if line_idx == start_line { start_col } else { line.len() };
-            
-            if let Some(col_idx) = line[..search_end].find(query) {
-                return Some((line_idx, col_idx));
-            }
-        }
-        
-        None
     }
 
     // Helper function to find all matches in content

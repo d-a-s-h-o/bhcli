@@ -1,0 +1,488 @@
+.TH BHCLI 1 "January 2026" "BHCLI 1.0" "User Commands"
+.SH NAME
+bhcli \- terminal client for le-chat-php chat systems
+.SH SYNOPSIS
+.B bhcli
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B bhcli
+is a sophisticated terminal-based client for anonymous communication over Tor. It connects to any le-chat-php chat server with full feature parity plus advanced capabilities like AI integration, bot automation, and developer tools.
+.PP
+Built for the darknet, optimized for Tor, works everywhere.
+.SH OPTIONS
+.SS "Authentication"
+.TP
+.BR \-u ", " \-\-username " \fIUSERNAME\fR"
+Set username (env: BHC_USERNAME)
+.TP
+.BR \-p ", " \-\-password " \fIPASSWORD\fR"
+Set password (env: BHC_PASSWORD)
+.TP
+.BR \-c ", " \-\-profile " \fIPROFILE\fR"
+Select configuration profile (default: "default")
+.TP
+.BR \-\-session " \fISESSION\fR"
+Use existing session ID to skip login
+.SS "Connection"
+.TP
+.BR \-\-url " \fIURL\fR"
+Override chat server URL
+.TP
+.BR \-\-page\-php " \fIPAGE\fR"
+Override chat page filename (default: chat.php)
+.TP
+.BR \-s ", " \-\-socks\-proxy\-url " \fIURL\fR"
+SOCKS proxy URL (default: socks5h://127.0.0.1:9050, env: BHC_PROXY_URL)
+.TP
+.BR \-\-no\-proxy
+Disable proxy usage
+.TP
+.BR \-r ", " \-\-refresh\-rate " \fISECONDS\fR"
+Message refresh rate (default: 5, env: BHC_REFRESH_RATE)
+.SS "Bot System"
+.TP
+.BR \-\-bot " \fINAME\fR"
+Enable background bot with specified name
+.TP
+.BR \-\-bot\-admins " \fIUSERS\fR"
+Comma-separated list of bot administrators
+.TP
+.BR \-\-bot\-data\-dir " \fIPATH\fR"
+Custom directory for bot data storage
+.SS "Display"
+.TP
+.BR \-g ", " \-\-guest\-color " \fICOLOR\fR"
+Set guest color theme
+.TP
+.BR \-m ", " \-\-manual\-captcha
+Enable manual captcha solving (env: BHC_MANUAL_CAPTCHA)
+.TP
+.BR \-\-sxiv
+Enable sxiv image viewer integration
+.SS "Integrations"
+.TP
+.BR \-\-dkf\-api\-key " \fIKEY\fR"
+DKF API key for notifications (env: DKF_API_KEY)
+.TP
+.BR \-\-dnmx\-username " \fIUSERNAME\fR"
+DNMX email username (env: DNMX_USERNAME)
+.TP
+.BR \-\-dnmx\-password " \fIPASSWORD\fR"
+DNMX email password (env: DNMX_PASSWORD)
+.SH KEYBOARD SHORTCUTS
+.SS "Navigation"
+.TP
+.BR j ", " "down arrow"
+Move down one message
+.TP
+.BR k ", " "up arrow"
+Move up one message
+.TP
+.BR J
+Jump down 5 messages
+.TP
+.BR K
+Jump up 5 messages
+.TP
+.BR gg
+Jump to top message
+.TP
+.BR "ctrl+d"
+Page down
+.TP
+.BR "ctrl+u"
+Page up
+.SS "Quick Actions"
+.TP
+.BR t
+Tag author of selected message
+.TP
+.BR p
+Start PM to author
+.TP
+.BR y ", " "ctrl+c"
+Copy selected message
+.TP
+.BR "shift+Y"
+Copy first link in message
+.TP
+.BR d
+Download embedded file
+.TP
+.BR D
+Download and open file
+.SS "View Toggles"
+.TP
+.BR m
+Toggle sound notifications
+.TP
+.BR "shift+G"
+Toggle guest view
+.TP
+.BR "shift+M"
+Toggle members view
+.TP
+.BR "ctrl+h"
+Toggle hidden messages
+.TP
+.BR backspace
+Hide selected message
+.SS "Input Editing"
+.TP
+.BR "ctrl+a"
+Move to start of line
+.TP
+.BR "ctrl+e"
+Move to end of line
+.TP
+.BR "ctrl+f"
+Move forward one word
+.TP
+.BR "ctrl+b"
+Move backward one word
+.TP
+.BR "ctrl+l"
+Toggle multiline mode
+.TP
+.BR "ctrl+." ", " "ctrl+x" ", " "ctrl+o"
+Open external editor
+.TP
+.BR "tab"
+Autocomplete username
+.SS "Moderation (Members+)"
+.TP
+.BR "ctrl+k"
+Prefill kick command
+.TP
+.BR "ctrl+b"
+Prefill ban command
+.TP
+.BR "ctrl+a"
+Prefill members message
+.TP
+.BR "ctrl+w"
+Send warning message
+.SH CHAT COMMANDS
+.SS "Basic"
+.TP
+.BR "/pm \fIUSER\fR \fIMESSAGE\fR"
+Send private message
+.TP
+.BR "/ignore \fIUSER\fR"
+Ignore user's messages
+.TP
+.BR "/unignore \fIUSER\fR"
+Unignore user
+.TP
+.BR "/f \fITERMS\fR"
+Filter messages by content
+.TP
+.BR "/u \fIPATH\fR [@\fIUSER\fR] [\fIMESSAGE\fR]"
+Upload file
+.SS "Moderation (Members+)"
+.TP
+.BR "/kick \fIUSER\fR [\fIREASON\fR]"
+Kick user from chat
+.TP
+.BR "/ban \fIUSER\fR"
+Ban user (fuzzy match)
+.TP
+.BR "/ban \(dq\fIUSER\fR\(dq"
+Ban exact username
+.TP
+.BR "/filter \fITEXT\fR"
+Add message filter
+.TP
+.BR "/unban \fIUSER\fR"
+Remove ban
+.TP
+.BR "/unfilter \fITEXT\fR"
+Remove filter
+.TP
+.BR "/banlist"
+Show banned users
+.TP
+.BR "/filterlist"
+Show filtered terms
+.TP
+.BR "/dl[\fIN\fR]"
+Delete last N messages (default: 1)
+.TP
+.BR "/dall"
+Delete all your messages
+.SS "ChatOps (30+ commands)"
+.TP
+.BR "/help [\fICOMMAND\fR]"
+List commands or get detailed help
+.TP
+.BR "/man \fICOMMAND\fR"
+System manual pages
+.TP
+.BR "/doc \fILANG\fR \fITERM\fR"
+Language documentation
+.TP
+.BR "/hash \fIALGO\fR \fITEXT\fR"
+Generate hash (md5/sha1/sha256/sha512)
+.TP
+.BR "/uuid"
+Generate UUID
+.TP
+.BR "/base64 \fIencode|decode\fR \fITEXT\fR"
+Base64 encoding/decoding
+.TP
+.BR "/regex \fIPATTERN\fR \fITEXT\fR"
+Test regex pattern
+.TP
+.BR "/github \fIUSER/REPO\fR"
+Repository information
+.TP
+.BR "/crates \fINAME\fR"
+Rust crate info
+.TP
+.BR "/npm \fINAME\fR"
+NPM package info
+.TP
+.BR "/pip \fINAME\fR"
+Python package info
+.TP
+.BR "/ping \fIHOST\fR"
+Test connectivity
+.TP
+.BR "/dig \fIDOMAIN\fR"
+DNS lookup
+.TP
+.BR "/whois \fIDOMAIN\fR"
+Domain registration info
+.SS "AI Features (requires OPENAI_API_KEY)"
+.TP
+.BR "/ai \fIoff|mod|reply\fR"
+Control AI mode
+.TP
+.BR "/ai \fIstrict|balanced|lenient\fR"
+Set moderation strictness
+.TP
+.BR "/translate \fILANG\fR \fITEXT\fR"
+Translate text
+.TP
+.BR "/detect \fITEXT\fR"
+Detect language
+.TP
+.BR "/sentiment \fITEXT\fR"
+Analyze sentiment
+.TP
+.BR "/summarize \fITEXT\fR"
+Summarize text
+.TP
+.BR "/fix \fICODE\fR"
+Get code fix suggestions
+.TP
+.BR "/review \fICODE\fR"
+Code quality review
+.SH BOT COMMANDS
+.PP
+Interact with bots by mentioning them in chat. Admin-only unless noted.
+.TP
+.BR "@\fIBOT\fR help"
+List bot commands (anyone)
+.TP
+.BR "@\fIBOT\fR stats \fIUSER\fR"
+View user statistics
+.TP
+.BR "@\fIBOT\fR recall \fITIME\fR"
+Find messages from specific time
+.TP
+.BR "@\fIBOT\fR search \fIQUERY\fR"
+Search message history
+.TP
+.BR "@\fIBOT\fR export \fIUSER\fR \fIDAYS\fR"
+Export user messages
+.TP
+.BR "@\fIBOT\fR restore \fIMSG_ID\fR"
+Restore deleted message
+.TP
+.BR "@\fIBOT\fR summary \fIHOURS\fR"
+Chat activity summary
+.TP
+.BR "@\fIBOT\fR users"
+List online users
+.SH CONFIGURATION
+.PP
+Configuration file: \fB~/.config/bhcli/bhcli.toml\fR
+.PP
+Example profile configuration:
+.PP
+.nf
+.RS
+[profiles]
+
+[profiles.default]
+username = "yourusername"
+password = "yourpassword"
+
+[commands]
+hello = "hey everyone!"
+afk = "away for a bit"
+.RE
+.fi
+.SH CUSTOM COMMANDS
+.PP
+Create shortcuts in config file under [commands] section. Use them with ! prefix:
+.PP
+.nf
+.RS
+!hello
+!afk
+!rules
+.RE
+.fi
+.SH ENVIRONMENT VARIABLES
+.TP
+.BR BHC_USERNAME
+Default username
+.TP
+.BR BHC_PASSWORD
+Default password
+.TP
+.BR BHC_PROXY_URL
+SOCKS proxy URL
+.TP
+.BR BHC_REFRESH_RATE
+Message refresh rate in seconds
+.TP
+.BR BHC_MANUAL_CAPTCHA
+Enable manual captcha mode
+.TP
+.BR OPENAI_API_KEY
+OpenAI API key for AI features
+.TP
+.BR DKF_API_KEY
+DKF API key for notifications
+.TP
+.BR DNMX_USERNAME
+DNMX email username
+.TP
+.BR DNMX_PASSWORD
+DNMX email password
+.SH FILES
+.TP
+.BR ~/.config/bhcli/bhcli.toml
+Main configuration file
+.TP
+.BR ./bhcli.log
+Log file (created in current directory)
+.TP
+.BR ./bot_data/
+Bot data storage directory
+.SH EXAMPLES
+.PP
+Basic usage with credentials:
+.PP
+.RS
+.nf
+bhcli -u myusername -p mypassword
+.fi
+.RE
+.PP
+Use specific profile:
+.PP
+.RS
+.nf
+bhcli -c myprofile
+.fi
+.RE
+.PP
+Connect through custom Tor port:
+.PP
+.RS
+.nf
+bhcli -s socks5h://127.0.0.1:9150
+.fi
+.RE
+.PP
+Direct connection (not recommended for darknet):
+.PP
+.RS
+.nf
+bhcli --no-proxy
+.fi
+.RE
+.PP
+Run with bot and admins:
+.PP
+.RS
+.nf
+bhcli --bot Assistant --bot-admins alice,bob
+.fi
+.RE
+.PP
+Using environment variables:
+.PP
+.RS
+.nf
+export BHC_USERNAME="myuser"
+export BHC_PASSWORD="mypass"
+export OPENAI_API_KEY="sk-..."
+bhcli
+.fi
+.RE
+.SH SECURITY
+.PP
+BHCLI is designed for anonymous communication:
+.IP \[bu] 2
+Always use Tor for darknet chats
+.IP \[bu]
+Never use --no-proxy with .onion addresses
+.IP \[bu]
+No telemetry or phone-home
+.IP \[bu]
+Local storage only
+.IP \[bu]
+Optional features minimize attack surface
+.PP
+For maximum security, route through Tor and use unique credentials per chat.
+.SH BUILDING
+.PP
+Build from source:
+.PP
+.RS
+.nf
+cargo build --release
+make release
+.fi
+.RE
+.PP
+Build without audio for headless servers:
+.PP
+.RS
+.nf
+cargo build --release --no-default-features
+make build-no-audio
+.fi
+.RE
+.PP
+Cross-platform builds:
+.PP
+.RS
+.nf
+make build-linux-musl
+make build-macos
+make build-windows
+make build-all
+.fi
+.RE
+.SH SEE ALSO
+.PP
+Full documentation: \fBMANUAL.md\fR
+.PP
+Optimization report: \fBOPTIMIZATION_REPORT.md\fR
+.PP
+Official repo: https://github.com/d-a-s-h-o/bhcli
+.SH BUGS
+.PP
+Report bugs at official mirror or GitHub issues.
+.SH AUTHOR
+.PP
+Built with ❤️ by Dasho.
+.SH COPYRIGHT
+.PP
+MIT License. See LICENSE file for details.

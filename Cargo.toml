@@ -1,49 +1,91 @@
 [package]
 name = "bhcli"
 version = "0.1.0"
-edition = "2018"
+edition = "2021"
+authors = ["Dasho"]
+description = "A sophisticated terminal-based client for le-chat-php chat systems"
+repository = "https://github.com/d-a-s-h-o/bhcli"
+license = "MIT"
+rust-version = "1.70"
+
+# Optimize for size and performance in release builds
+[profile.release]
+opt-level = 3           # Maximum optimization
+lto = true              # Enable Link Time Optimization
+codegen-units = 1       # Better optimization, slower compile
+strip = true            # Strip symbols from binary
+panic = "abort"         # Smaller binary size
 
 [profile.dev]
 debug = true
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+opt-level = 0
+
+# Define feature flags
+[features]
+default = ["audio"]
+audio = ["dep:rodio"]
 
 [dependencies]
-anyhow = "1.0.70"
-base64 = "0.21.0"
-bresenham = "0.1.1"
-chrono = "0.4.19"
-clap = { version = "4.1.14", features = ["derive", "env"] }
-clipboard = "0.5.0"
-colors-transform = "0.2.4"
-confy = "0.5.1"
-crossbeam = "0.8.1"
-crossbeam-channel = "0.5.15"
-crossterm = { version = "0.26.1" }
-http = "0.2.4"
-image = "0.24.6"
-lazy_static = "1.4.0"
-linkify = "0.9.0"
-log = "0.4.17"
-log4rs = "1.2.0"
-rand = "0.8.4"
-regex = "1.5.4"
-reqwest = { version = "0.11.4", features = ["blocking", "cookies", "socks", "multipart"] }
-rodio = "0.17.1"
-rpassword = "7.2.0"
-select = "0.6.0-alpha.1"
-serde = "1.0.130"
-serde_derive = "1.0.88"
-serde_json = "1.0"
-termage = "1.1.1"
-textwrap = "0.16.0"
-toml = "0.7.3"
-tui = { version = "0.19.0", features = ["crossterm"], default-features = false  }
-unicode-width = "0.1.8"
-async-openai = "0.29.0"
+# Core dependencies
+anyhow = "1.0"
+clap = { version = "4.1", features = ["derive", "env"] }
+log = "0.4"
+log4rs = "1.2"
+
+# Terminal UI
+crossterm = "0.26"
+tui = { version = "0.19", features = ["crossterm"], default-features = false }
+termage = "1.1"
+
+# Async runtime
 tokio = { version = "1.0", features = ["full"] }
-# ChatOps dependencies
+
+# HTTP client
+reqwest = { version = "0.11", features = ["blocking", "cookies", "socks", "multipart", "native-tls-vendored"] }
+http = "0.2"
+
+# AI integration
+async-openai = "0.29"
+
+# Serialization
+serde = "1.0"
+serde_derive = "1.0"
+serde_json = "1.0"
+toml = "0.7"
+confy = "0.5"
+
+# Text processing
+regex = "1.5"
+linkify = "0.9"
+textwrap = "0.16"
+unicode-width = "0.1"
+select = "0.6"
+
+# Utilities
+chrono = "0.4"
 uuid = { version = "1.0", features = ["v4"] }
+lazy_static = "1.4"
+rand = "0.8"
+base64 = "0.21"
+tempfile = "3.10"
+
+# Cryptography
 md5 = "0.7"
 sha1 = "0.10"
 sha2 = "0.10"
-tempfile = "3.10"
+
+# System integration
+clipboard = "0.5"
+rpassword = "7.2"
+colors-transform = "0.2"
+image = "0.24"
+
+# Optional audio support
+rodio = { version = "0.17", optional = true }
+
+# Threading
+crossbeam = "0.8"
+crossbeam-channel = "0.5"
+
+# Graphics/Captcha support
+bresenham = "0.1"

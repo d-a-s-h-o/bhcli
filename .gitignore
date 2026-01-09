@@ -1,8 +1,52 @@
+# Rust build artifacts
+/target/
+/dist/
+Cargo.lock
+
+# Debug and profiling
+*.pdb
+*.profdata
+*.profraw
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Rust-specific
+**/*.rs.bk
+*.pdb
+
+# Project-specific
 captcha.gif
-samples
-target
-dist
+samples/
 *.log
 *.svg
 *.env
 .cargo_home/
+bot_data/
+
+# Temporary files
+*.tmp
+*.temp
+.*.swp
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Test coverage
+*.profraw
+*.profdata
+coverage/
+tarpaulin-report.html
+
+# Documentation builds
+/doc/
+
+# Configuration (may contain sensitive data)
+config.toml
+*.toml.bak

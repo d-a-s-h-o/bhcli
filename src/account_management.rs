@@ -76,15 +76,6 @@ impl AccountManager {
         self.setup_default_delegated_commands();
     }
 
-    /// Clear account relationships
-    pub fn clear_relationships(&mut self) {
-        self.master_account = None;
-        self.alt_account = None;
-        self.is_master = false;
-        *self.last_verified_together.borrow_mut() = None;
-        self.delegated_commands.clear();
-    }
-
     /// Check the current relationship status
     pub fn get_relationship_status(&self, users: &Arc<Mutex<Users>>) -> AccountRelationshipStatus {
         if self.master_account.is_none() && self.alt_account.is_none() {
@@ -194,7 +185,7 @@ impl AccountManager {
                 if args.len() >= 2 {
                     let target = args[0];
                     let message = args[1..].join(" ");
-                    if let Some(master) = &self.master_account {
+                    if self.master_account.is_some() {
                         Some(format!("/pm {} [via {}] {}", target, self.current_user, message))
                     } else {
                         None
@@ -264,16 +255,6 @@ impl AccountManager {
                 }
             }
         }
-    }
-
-    /// Add a custom delegated command
-    pub fn add_delegated_command(&mut self, alias: String, template: String) {
-        self.delegated_commands.insert(alias, template);
-    }
-
-    /// Remove a custom delegated command
-    pub fn remove_delegated_command(&mut self, alias: &str) -> bool {
-        self.delegated_commands.remove(alias).is_some()
     }
 
     /// Set up default delegated commands
@@ -350,22 +331,6 @@ impl AccountManager {
             }
         }
     }
-}
-
-/// Helper function to parse forwarded commands from alt accounts
-pub fn parse_alt_forwarded_command(message: &str, alt_account: &str) -> Option<(String, Vec<String>)> {
-    // Look for patterns like "[via altname] /command args"
-    let prefix = format!("[via {}] /", alt_account);
-    if message.starts_with(&prefix) {
-        let command_part = &message[prefix.len()..];
-        let parts: Vec<&str> = command_part.split_whitespace().collect();
-        if !parts.is_empty() {
-            let command = parts[0].to_string();
-            let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
-            return Some((command, args));
-        }
-    }
-    None
 }
 
 /// Enhanced command parsing that handles master/alt delegation
